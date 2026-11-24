@@ -4,12 +4,9 @@
 
 <h1 align="center">Angel Agent</h1>
 
-<p align="center">
-ربات تلگرام دستیار هوش مصنوعی فارسی
-<br>
-استریم زنده · حافظهٔ SQLite · بکاپ رمزنگاری‌شده روی GitHub
-<br><br>
-<a href="https://9router.com">9router</a>
+<p align="center" dir="rtl">
+  ربات تلگرام دستیار هوش مصنوعی فارسی<br>
+  متصل به <a href="https://9router.com">9router</a> · استریم زنده · حافظهٔ SQLite · بکاپ رمزنگاری‌شده روی GitHub
 </p>
 
 ## امکانات
