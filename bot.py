@@ -56,6 +56,14 @@ async def main() -> None:
     except Exception:
         log.exception("GitHub backups are disabled (check the backup settings)")
 
+    if config.RESTORE_ON_START and backups.enabled and memory.total_messages() == 0:
+        try:
+            result = await backups.restore_latest()
+            log.info("restored on start: %s messages, %s archived, tag=%s",
+                     result["messages"], result["archived"], result["tag"])
+        except Exception:
+            log.exception("restore on start failed")
+
     app = Client(
         "angel-ai",
         api_id=config.API_ID,

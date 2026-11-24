@@ -67,6 +67,7 @@ railway variable set -s "$SERVICE" --skip-deploys \
   GITHUB_BACKUP_REPO="${GITHUB_BACKUP_REPO:-}" \
   BACKUP_KEEP="${BACKUP_KEEP:-14}" \
   BACKUP_AUTO_HOURS="${BACKUP_AUTO_HOURS:-24}" \
+  RESTORE_ON_START="${RESTORE_ON_START:-1}" \
   RAILWAY_DEPLOYMENT_DRAINING_SECONDS=20 >/dev/null
 
 echo "→ دیپلوی"

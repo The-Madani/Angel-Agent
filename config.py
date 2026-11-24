@@ -106,6 +106,7 @@ GITHUB_BACKUP_TOKEN = _str("GITHUB_BACKUP_TOKEN")
 BACKUP_PASSPHRASE = _str("BACKUP_PASSPHRASE")
 BACKUP_KEEP = max(1, _int("BACKUP_KEEP", 14))
 BACKUP_AUTO_HOURS = _float("BACKUP_AUTO_HOURS", 24.0)
+RESTORE_ON_START = os.environ.get("RESTORE_ON_START", "").lower() in ("1", "true", "yes", "on")
 
 
 def validate() -> None:
