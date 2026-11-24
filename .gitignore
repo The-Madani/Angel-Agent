@@ -1,0 +1,12 @@
+.venv/
+data/
+logs/
+backups/
+__pycache__/
+*.py[cod]
+.env
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm

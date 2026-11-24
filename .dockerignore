@@ -1,0 +1,12 @@
+.venv
+data
+logs
+backups
+.env
+.git
+.gitignore
+__pycache__
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
