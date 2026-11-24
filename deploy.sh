@@ -39,6 +39,9 @@ fi
 echo "→ سرویس: $SERVICE"
 railway service "$SERVICE" >/dev/null 2>&1 || railway add --service "$SERVICE"
 
+echo "→ منطقه US East"
+railway scale us-east=1 -s "$SERVICE" >/dev/null 2>&1 || echo "  (منطقه از قبل تنظیم است)"
+
 echo "→ ولوم /data"
 railway volume add --mount-path /data -s "$SERVICE" >/dev/null 2>&1 \
   && echo "  volume created" \

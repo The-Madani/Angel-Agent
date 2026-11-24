@@ -211,6 +211,7 @@ class BackupManager:
             return {
                 "messages": self.memory.total_messages(),
                 "chats": self.memory.total_chats(),
+                "archived": self.memory.total_archived(),
                 "pre_restore": str(pre),
                 "tag": info.tag,
                 "size": info.size,

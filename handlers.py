@@ -280,6 +280,7 @@ class BotHandlers:
                 f"🌍 کل ربات\n"
                 f"چت‌ها: {total['chats']:,}\n"
                 f"پیام‌ها: {total['messages']:,}\n"
+                f"آرشیو کامل: {total['archived']:,}\n"
                 f"حجم دیتابیس: {kb:.1f} KB\n"
                 f"مدل: {config.MODEL}\n"
                 f"بکاپ گیت‌هاب: {'فعال' if self.backups.enabled else 'غیرفعال'}"
@@ -403,6 +404,7 @@ class BotHandlers:
                 f"✅ بازگردانی انجام شد از {result['tag']}\n"
                 f"چت‌ها: {result['chats']:,}\n"
                 f"پیام‌ها: {result['messages']:,}\n"
+                f"آرشیو: {result['archived']:,}\n"
                 f"نسخهٔ قبلی: {Path(result['pre_restore']).name}"
             ),
         )

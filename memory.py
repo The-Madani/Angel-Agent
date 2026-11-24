@@ -37,6 +37,15 @@ class Memory:
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
+            CREATE TABLE IF NOT EXISTS archived_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER NOT NULL,
+                role       TEXT    NOT NULL,
+                content    TEXT    NOT NULL,
+                created_at INTEGER NOT NULL,
+                archived_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_archived_chat ON archived_messages(chat_id, id);
             CREATE TABLE IF NOT EXISTS stats (
                 chat_id          INTEGER PRIMARY KEY,
                 requests         INTEGER NOT NULL DEFAULT 0,
@@ -111,6 +120,14 @@ class Memory:
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 self.db.execute(
+                    f"""
+                    INSERT INTO archived_messages (chat_id, role, content, created_at, archived_at)
+                    SELECT chat_id, role, content, created_at, ?
+                    FROM messages WHERE id IN ({placeholders})
+                    """,
+                    [now, *ids],
+                )
+                self.db.execute(
                     f"DELETE FROM messages WHERE id IN ({placeholders})", ids
                 )
             self.db.execute(
@@ -144,6 +161,10 @@ class Memory:
 
     def total_chats(self) -> int:
         row = self.db.execute("SELECT COUNT(DISTINCT chat_id) FROM messages").fetchone()
+        return int(row[0]) if row else 0
+
+    def total_archived(self) -> int:
+        row = self.db.execute("SELECT COUNT(*) FROM archived_messages").fetchone()
         return int(row[0]) if row else 0
 
     def reopen(self) -> None:
@@ -205,6 +226,7 @@ class Memory:
         return {
             "chats": int(rows[0]) if rows else 0,
             "messages": int(messages[0]) if messages else 0,
+            "archived": self.total_archived(),
             "bytes": self.path.stat().st_size if self.path.exists() else 0,
         }
 
