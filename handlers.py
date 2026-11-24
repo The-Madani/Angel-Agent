@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
+import tempfile
 import time
 from collections import deque
 from datetime import datetime
@@ -16,6 +18,7 @@ from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 
 import config
+import files
 from backups import BackupError, BackupManager
 from compactor import Compactor
 from memory import Memory
@@ -26,6 +29,10 @@ log = logging.getLogger(__name__)
 
 USER_HELP = """👋 سلام!
 هر سؤالی داری همین‌جا بپرس، جواب می‌دم.
+
+می‌تونی فایل هم بفرستی: PDF، Word، Excel، PowerPoint، فایل متنی/کد و عکس.
+اسمش رو هم بنویس چی می‌خوای (مثلاً «خلاصه‌ش کن»).
+اگه روی یک پیام (مال خودت یا من) ریپلای کنی، همون پیام رو هم می‌بینم.
 
 دستورها:
 /reset — پاک کردن حافظهٔ گفتگو
@@ -43,6 +50,7 @@ ADMIN_HELP = """
 /id — آیدی"""
 
 RATE_WARNING = "یه کم آرومتر 🙂"
+QUOTE_MAX_CHARS = 20_000
 
 
 class BotHandlers:
@@ -90,7 +98,8 @@ class BotHandlers:
         self.handled += 1
 
         text = (message.text or "").strip()
-        if not text:
+        caption = (message.caption or "").strip()
+        if not text and not message.document and not message.photo:
             return
 
         if text.startswith("/"):
@@ -104,12 +113,11 @@ class BotHandlers:
                 await self._reply(message, RATE_WARNING)
             return
 
-        cleaned = self._strip_mention(text)
-        if not cleaned:
-            return
-
         await self._cancel(message.chat.id)
-        task = asyncio.create_task(self._answer(client, message, cleaned))
+        cleaned = self._strip_mention(text) if text else ""
+        if text and not cleaned:
+            return
+        task = asyncio.create_task(self._respond(client, message, cleaned, caption))
         self._tasks[message.chat.id] = task
         task.add_done_callback(
             lambda t, cid=message.chat.id: self._tasks.pop(cid, None)
@@ -127,7 +135,7 @@ class BotHandlers:
             return False
         if message.sender_chat is not None or message.via_bot is not None:
             return False
-        return bool((message.text or "").strip())
+        return bool((message.text or "").strip()) or message.document is not None or message.photo is not None
 
     def _remember(self, message: Message) -> bool:
         key = (message.chat.id, message.id)
@@ -158,13 +166,156 @@ class BotHandlers:
             text = self._mention.sub(" ", text)
         return " ".join(text.split())
 
+    # ------------------------------------------------------------------ media
+    async def _respond(
+        self, client: Client, message: Message, text: str, caption: str
+    ) -> None:
+        """Build one model turn from the message, its file, and any quoted reply."""
+        quote_label, quote_text, quote_images = await self._quote(client, message.reply_to_message)
+
+        attachment: list[dict] = list(quote_images)
+        stored: str | None = None
+
+        if message.document is not None:
+            parsed = await self._document(client, message)
+            if parsed is None:
+                return
+            name, body = parsed
+            question = text or caption or "این فایل رو بخون و خلاصه‌اش رو بگو."
+            text = f"فایل «{name}» رو فرستادم. {question}\n\n--- محتوای فایل ---\n{body}"
+        elif message.photo is not None:
+            raw = await self._photo_bytes(client, message)
+            if raw is None:
+                return
+            attachment.append(self._image_part(raw))
+            question = text or caption or "این عکس رو ببین و بگو چی توش هست."
+            stored = f"[عکس] {question}"
+            text = question
+
+        if not text.strip():
+            return
+
+        if quote_text:
+            header = f"[در پاسخ به {quote_label}]:\n«{quote_text}»"
+            text = header + "\n\n" + text
+            if stored:
+                stored = header + "\n\n" + stored
+
+        await self._answer(
+            client, message, text, attachment=attachment or None, stored=stored
+        )
+
+    async def _quote(self, client: Client, quoted: Message | None) -> tuple[str, str, list[dict]]:
+        """Text and images of the message the user replied to (if any)."""
+        if quoted is None or getattr(quoted, "empty", False) or quoted.service:
+            return "", "", []
+        is_bot = bool(quoted.from_user and quoted.from_user.is_self) or quoted.outgoing
+        label = "پیام خودم" if is_bot else "پیام خودت"
+        body = (quoted.text or quoted.caption or "").strip()
+        images: list[dict] = []
+
+        if quoted.document is not None:
+            parsed = await self._document(client, quoted, report=False)
+            if parsed:
+                name, content = parsed
+                body = (body + "\n\n" if body else "") + f"[فایل «{name}»]\n{content}"
+        elif quoted.photo is not None:
+            raw = await self._photo_bytes(client, quoted, report=False)
+            if raw:
+                images.append(self._image_part(raw))
+                body = (body + "\n\n" if body else "") + "[عکس]"
+
+        body = body[:QUOTE_MAX_CHARS].strip()
+        if not body and not images:
+            return "", "", []
+        return label, body, images
+
+    async def _document(
+        self, client: Client, message: Message, *, report: bool = True
+    ) -> tuple[str, str] | None:
+        document = message.document
+        name = document.file_name or "file"
+        size = document.file_size or 0
+        if size > files.MAX_FILE_BYTES:
+            if report:
+                await self._reply(message, "⚠️ فایل بزرگ‌تر از ۲۰ مگابایته و تلگرام اجازهٔ دانلودش رو نمی‌ده.")
+            return None
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / self._safe_name(name)
+                downloaded = await client.download_media(message, file_name=str(path))
+                if not downloaded:
+                    raise files.FileError("فایل دانلود نشد.")
+                body = await asyncio.to_thread(files.extract_text, Path(downloaded), name)
+        except files.UnsupportedFile as exc:
+            if report:
+                await self._reply(message, f"⚠️ {exc}\nفرمت‌های پشتیبانی‌شده: {files.SUPPORTED_HINT}.")
+            return None
+        except files.FileError as exc:
+            if report:
+                await self._reply(message, f"⚠️ {exc}")
+            return None
+        except Exception:
+            log.exception("reading document failed in chat %s", message.chat.id)
+            if report:
+                await self._reply(message, "⚠️ خواندن فایل نشد. یه بار دیگه بفرست.")
+            return None
+        return name, body
+
+    async def _photo_bytes(
+        self, client: Client, message: Message, *, report: bool = True
+    ) -> bytes | None:
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "photo.jpg"
+                downloaded = await client.download_media(message, file_name=str(path))
+                if not downloaded:
+                    raise files.FileError("عکس دانلود نشد.")
+                raw = await asyncio.to_thread(Path(downloaded).read_bytes)
+        except files.FileError as exc:
+            if report:
+                await self._reply(message, f"⚠️ {exc}")
+            return None
+        except Exception:
+            log.exception("downloading photo failed in chat %s", message.chat.id)
+            if report:
+                await self._reply(message, "⚠️ عکس دانلود نشد. یه بار دیگه بفرست.")
+            return None
+
+        if len(raw) > files.MAX_FILE_BYTES:
+            if report:
+                await self._reply(message, "⚠️ عکس خیلی بزرگه.")
+            return None
+        return raw
+
+    @staticmethod
+    def _image_part(raw: bytes) -> dict:
+        return {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(raw).decode()},
+        }
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        cleaned = re.sub(r"[^\w.\- ]+", "_", Path(name).name).strip(" .")
+        return (cleaned or "file")[:120]
+
     # ------------------------------------------------------------------ answer
-    async def _answer(self, client: Client, message: Message, text: str) -> None:
+    async def _answer(
+        self,
+        client: Client,
+        message: Message,
+        text: str,
+        *,
+        attachment: list[dict] | None = None,
+        stored: str | None = None,
+    ) -> None:
         chat_id = message.chat.id
         started = time.perf_counter()
-        msg_id = self.memory.add_message(chat_id, "user", text)
+        msg_id = self.memory.add_message(chat_id, "user", stored or text)
         streamer = TelegramStreamer(client, chat_id)
-        request_messages = self._build_messages(chat_id)
+        request_messages = self._build_messages(chat_id, attachment)
 
         try:
             answer = await streamer.run(self.router.stream(request_messages))
@@ -201,14 +352,27 @@ class BotHandlers:
         )
         self.compactor.schedule(chat_id)
 
-    def _build_messages(self, chat_id: int) -> list[dict[str, str]]:
+    def _build_messages(
+        self, chat_id: int, attachment: list[dict] | None = None
+    ) -> list[dict]:
         summary, recent = self.memory.get_context(chat_id, config.CONTEXT_MAX_CHARS)
-        messages: list[dict[str, str]] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+        messages: list[dict] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
         if summary:
             messages.append(
                 {"role": "system", "content": "خلاصهٔ گفتگوهای قبلی (برای زمینه):\n" + summary}
             )
         messages.extend(recent)
+        if attachment:
+            if messages and messages[-1].get("role") == "user":
+                messages[-1] = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": str(messages[-1].get("content") or "")},
+                        *attachment,
+                    ],
+                }
+            else:
+                messages.append({"role": "user", "content": attachment})
         return messages
 
     async def _cancel(self, chat_id: int) -> None:
@@ -427,7 +591,19 @@ class BotHandlers:
             log.warning("reply failed in chat %s", message.chat.id, exc_info=True)
 
 
-def estimate_tokens(messages: list[dict[str, str]] | str) -> int:
+def estimate_tokens(messages: list[dict] | str) -> int:
     if isinstance(messages, str):
         return max(1, len(messages) // 3)
-    return max(1, sum(len(m.get("content", "")) for m in messages) // 3)
+    return max(1, sum(_content_chars(m.get("content")) for m in messages) // 3)
+
+
+def _content_chars(content: object) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(
+            len(str(part.get("text") or ""))
+            for part in content
+            if isinstance(part, dict)
+        )
+    return 0
