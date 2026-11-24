@@ -5,9 +5,11 @@
 <h1 align="center">Angel Agent</h1>
 
 <p align="center">
-  <b>Angel Agent</b> — ربات تلگرام دستیار هوش مصنوعی فارسی
-  <br>
-  متصل به <a href="https://9router.com">9router</a>، با استریم زنده، حافظهٔ SQLite و بکاپ رمزنگاری‌شده روی GitHub
+ربات تلگرام دستیار هوش مصنوعی فارسی
+<br>
+استریم زنده · حافظهٔ SQLite · بکاپ رمزنگاری‌شده روی GitHub
+<br><br>
+<a href="https://9router.com">9router</a>
 </p>
 
 ## امکانات
