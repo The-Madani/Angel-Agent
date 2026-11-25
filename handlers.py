@@ -19,6 +19,7 @@ from pyrogram.types import Message
 
 import config
 import files
+import tools
 from backups import BackupError, BackupManager
 from compactor import Compactor
 from memory import Memory
@@ -51,6 +52,7 @@ ADMIN_HELP = """
 
 RATE_WARNING = "یه کم آرومتر 🙂"
 QUOTE_MAX_CHARS = 20_000
+TOOL_RESULT_MAX = 12_000
 
 
 class BotHandlers:
@@ -317,8 +319,45 @@ class BotHandlers:
         streamer = TelegramStreamer(client, chat_id)
         request_messages = self._build_messages(chat_id, attachment)
 
+        prompt_tokens = 0
+        completion_tokens = 0
+        reasoning_tokens = 0
+        rounds = 0
+        saw_usage = False
+
         try:
-            answer = await streamer.run(self.router.stream(request_messages))
+            while True:
+                allow_tools = bool(config.TOOLS_ENABLED) and rounds < config.TOOL_MAX_ROUNDS
+                answer = await streamer.run(
+                    self.router.stream(
+                        request_messages, tools=tools.SCHEMAS if allow_tools else None
+                    ),
+                    allow_empty=allow_tools,
+                )
+
+                usage = streamer.usage or {}
+                if usage:
+                    saw_usage = True
+                    details = usage.get("completion_tokens_details") or {}
+                    prompt_tokens += int(usage.get("prompt_tokens") or 0)
+                    completion_tokens += int(usage.get("completion_tokens") or 0)
+                    reasoning_tokens += int(
+                        usage.get("reasoning_tokens") or details.get("reasoning_tokens") or 0
+                    )
+
+                calls = streamer.tool_calls
+                streamer.tool_calls = []
+                if not calls:
+                    break
+
+                rounds += 1
+                request_messages = await self._run_tools(request_messages, calls)
+                log.info(
+                    "tools in chat %s (round %s): %s",
+                    chat_id,
+                    rounds,
+                    ", ".join(tools.describe(c.get("function", {}).get("name", ""), c.get("function", {}).get("arguments", "")) for c in calls),
+                )
         except asyncio.CancelledError:
             self.memory.delete_message(msg_id)
             raise
@@ -335,13 +374,10 @@ class BotHandlers:
 
         self.memory.add_message(chat_id, "assistant", answer)
 
-        usage = streamer.usage or {}
-        details = usage.get("completion_tokens_details") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or estimate_tokens(request_messages))
-        completion_tokens = int(usage.get("completion_tokens") or estimate_tokens(answer))
-        reasoning_tokens = int(
-            usage.get("reasoning_tokens") or details.get("reasoning_tokens") or streamer.reasoning_chars // 3
-        )
+        if not saw_usage:
+            prompt_tokens = estimate_tokens(request_messages)
+            completion_tokens = estimate_tokens(answer)
+        reasoning_tokens = reasoning_tokens or streamer.reasoning_chars // 3
 
         self.memory.bump_stats(
             chat_id,
@@ -374,6 +410,35 @@ class BotHandlers:
             else:
                 messages.append({"role": "user", "content": attachment})
         return messages
+
+    async def _run_tools(self, messages: list[dict], calls: list[dict]) -> list[dict]:
+        """Run the tool calls the model asked for and append their results."""
+        assistant: dict = {"role": "assistant", "content": None, "tool_calls": []}
+        for index, call in enumerate(calls):
+            fn = call.get("function") or {}
+            assistant["tool_calls"].append(
+                {
+                    "id": str(call.get("id") or f"call_{index}"),
+                    "type": "function",
+                    "function": {
+                        "name": str(fn.get("name") or ""),
+                        "arguments": str(fn.get("arguments") or "{}"),
+                    },
+                }
+            )
+
+        out = [*messages, assistant]
+        for call in assistant["tool_calls"]:
+            fn = call["function"]
+            result = await tools.call(fn["name"], fn["arguments"])
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": result[:TOOL_RESULT_MAX],
+                }
+            )
+        return out
 
     async def _cancel(self, chat_id: int) -> None:
         task = self._tasks.pop(chat_id, None)

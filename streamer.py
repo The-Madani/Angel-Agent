@@ -88,9 +88,13 @@ class TelegramStreamer:
         self.reasoning_chars = 0
         self.usage: dict | None = None
         self.error: str | None = None
+        self.tool_calls: list[dict] = []
 
     # ------------------------------------------------------------------ public
-    async def run(self, events: AsyncIterator[tuple[str, object]]) -> str:
+    async def run(
+        self, events: AsyncIterator[tuple[str, object]], *, allow_empty: bool = False
+    ) -> str:
+        self._stopped.clear()
         self._typing_task = asyncio.create_task(self._typing_loop())
         started = time.monotonic()
         try:
@@ -108,6 +112,10 @@ class TelegramStreamer:
                 if kind == "usage":
                     self.usage = payload if isinstance(payload, dict) else None
                     continue
+                if kind == "tool_calls":
+                    if isinstance(payload, list):
+                        self.tool_calls = payload
+                    continue
                 if kind == "content":
                     self._chunks.append(str(payload))
                     if not self._answer_started:
@@ -119,6 +127,8 @@ class TelegramStreamer:
                         self._last_edit = time.monotonic()
 
             if not self._answer_started:
+                if allow_empty:
+                    return ""
                 await self._replace_placeholder(ERROR_TEXT)
                 self.error = "empty answer"
                 return ""

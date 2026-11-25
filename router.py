@@ -19,7 +19,7 @@ class RouterError(RuntimeError):
     pass
 
 
-Message = dict[str, str]
+Message = dict[str, object]
 
 
 class Router:
@@ -54,20 +54,26 @@ class Router:
 
     # ------------------------------------------------------------------ stream
     async def stream(
-        self, messages: Iterable[Message], *, max_tokens: int | None = None
+        self,
+        messages: Iterable[Message],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[tuple[str, object]]:
-        """Yield ("reasoning"|"content", text) and finally ("usage", dict)."""
+        """Yield ("reasoning"|"content"|"tool_call", data) and finally ("usage", dict)."""
         if self._session is None or self._session.closed:
             await self.start()
         assert self._session is not None
 
-        payload = {
+        payload: dict[str, object] = {
             "model": config.MODEL,
             "messages": list(messages),
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": max_tokens or config.MAX_TOKENS,
         }
+        if tools:
+            payload["tools"] = tools
 
         async with self._sem:
             try:
@@ -75,6 +81,9 @@ class Router:
                     if resp.status != 200:
                         body = (await resp.text())[:300].replace("\n", " ")
                         raise RouterError(f"HTTP {resp.status}: {body}")
+
+                    # Accumulate incomplete tool calls arriving across SSE chunks.
+                    tool_calls_acc: dict[int, dict] = {}
 
                     async for raw in resp.content:
                         line = raw.decode("utf-8", "ignore").strip()
@@ -102,6 +111,26 @@ class Router:
                         content = delta.get("content")
                         if content:
                             yield ("content", content)
+
+                        # Tool calls can come as delta stream
+                        deltas = delta.get("tool_calls") or ()
+                        for tc in deltas:
+                            idx = tc.get("index", 0)
+                            acc = tool_calls_acc.setdefault(
+                                idx,
+                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                            )
+                            if tc.get("id"):
+                                acc["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                acc["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                acc["function"]["arguments"] += fn["arguments"]
+
+                    if tool_calls_acc:
+                        calls = [v for k, v in sorted(tool_calls_acc.items())]
+                        yield ("tool_calls", calls)
             except asyncio.CancelledError:
                 raise
             except aiohttp.ClientError as exc:

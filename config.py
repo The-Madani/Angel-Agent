@@ -75,7 +75,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "اگه سؤال توضیح لازم داشت، فقط تا حد لازم توضیح بده.\n"
     "اگه سؤال پزشکی پرسید، کامل و دقیق کمکش کن و توصیه‌های لازم رو بده. "
     "فقط اگه واقعاً لازم بود، آخر جواب بگو به کدوم متخصص مراجعه کنه.\n"
-    "اگه چیزی رو نمی‌دونی، صادقانه بگو و اطلاعات الکی نساز."
+    "اگه چیزی رو نمی‌دونی، صادقانه بگو و اطلاعات الکی نساز.\n"
+    "اگه کاربر لینک فرستاد، یا جواب سؤالی تازه/به‌روز رو نمی‌دونی، "
+    "از ابزارها استفاده کن: خوندن همون لینک (read_link) یا جست‌وجو در اینترنت (web_search). "
+    "فقط از ابزارهای موجود استفاده کن و نام آن‌ها را عیناً بنویس."
 )
 SYSTEM_PROMPT = _str("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
@@ -99,6 +102,12 @@ RATE_WINDOW = _float("RATE_WINDOW", 10.0)
 RATE_MAX_MESSAGES = _int("RATE_MAX_MESSAGES", 8)
 
 DEBUG = os.environ.get("DEBUG", "").lower() not in ("", "0", "false", "no")
+
+# --- Tools (web browsing the model can call itself) -------------------------
+TOOLS_ENABLED = os.environ.get("TOOLS_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+TOOL_MAX_ROUNDS = max(1, _int("TOOL_MAX_ROUNDS", 3))
+TOOL_TIMEOUT = _float("TOOL_TIMEOUT", 25.0)
+TOOL_MAX_CHARS = _int("TOOL_MAX_CHARS", 24000)
 
 # --- Backups ----------------------------------------------------------------
 GITHUB_BACKUP_REPO = _str("GITHUB_BACKUP_REPO")
