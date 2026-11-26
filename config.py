@@ -64,7 +64,7 @@ ROUTER_BASE_URL = _str(
 ROUTER_API_KEY = _str("ROUTER_API_KEY")
 MODEL = _str("MODEL", "fbot")
 MAX_TOKENS = _int("MAX_TOKENS", 8192)
-REQUEST_TIMEOUT = _float("REQUEST_TIMEOUT", 180.0)
+REQUEST_TIMEOUT = _float("REQUEST_TIMEOUT", 300.0)
 MAX_CONCURRENT = _int("MAX_CONCURRENT", 20)
 
 # --- Persona ----------------------------------------------------------------
@@ -105,8 +105,8 @@ DEBUG = os.environ.get("DEBUG", "").lower() not in ("", "0", "false", "no")
 
 # --- Tools (web browsing the model can call itself) -------------------------
 TOOLS_ENABLED = os.environ.get("TOOLS_ENABLED", "1").lower() not in ("0", "false", "no", "off")
-TOOL_MAX_ROUNDS = max(1, _int("TOOL_MAX_ROUNDS", 3))
-TOOL_TIMEOUT = _float("TOOL_TIMEOUT", 25.0)
+TOOL_MAX_ROUNDS = max(1, _int("TOOL_MAX_ROUNDS", 2))
+TOOL_TIMEOUT = _float("TOOL_TIMEOUT", 20.0)
 TOOL_MAX_CHARS = _int("TOOL_MAX_CHARS", 24000)
 
 # --- Backups ----------------------------------------------------------------

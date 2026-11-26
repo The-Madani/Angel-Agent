@@ -353,17 +353,29 @@ class BotHandlers:
                 rounds += 1
                 request_messages = await self._run_tools(request_messages, calls)
                 log.info(
-                    "tools in chat %s (round %s): %s",
+                    "tools in chat %s (round %s/%s): %s",
                     chat_id,
                     rounds,
-                    ", ".join(tools.describe(c.get("function", {}).get("name", ""), c.get("function", {}).get("arguments", "")) for c in calls),
+                    config.TOOL_MAX_ROUNDS,
+                    ", ".join(
+                        tools.describe(
+                            c.get("function", {}).get("name", ""),
+                            c.get("function", {}).get("arguments", ""),
+                        )
+                        for c in calls
+                    ),
                 )
         except asyncio.CancelledError:
             self.memory.delete_message(msg_id)
             raise
         except Exception:
             self.memory.delete_message(msg_id)
-            log.warning("answer failed in chat %s", chat_id, exc_info=True)
+            log.warning(
+                "answer failed in chat %s after %s tool rounds",
+                chat_id,
+                rounds,
+                exc_info=True,
+            )
             return
 
         if not answer.strip():
