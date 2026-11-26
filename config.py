@@ -108,6 +108,7 @@ TOOLS_ENABLED = os.environ.get("TOOLS_ENABLED", "1").lower() not in ("0", "false
 TOOL_MAX_ROUNDS = max(1, _int("TOOL_MAX_ROUNDS", 2))
 TOOL_TIMEOUT = _float("TOOL_TIMEOUT", 20.0)
 TOOL_MAX_CHARS = _int("TOOL_MAX_CHARS", 24000)
+BRAVE_API_KEY = _str("BRAVE_API_KEY")
 
 # --- Backups ----------------------------------------------------------------
 GITHUB_BACKUP_REPO = _str("GITHUB_BACKUP_REPO")

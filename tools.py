@@ -295,38 +295,92 @@ def parse_search(html: str) -> list[tuple[str, str, str]]:
 
 
 async def web_search(query: str) -> str:
-    """Search DuckDuckGo and return the top results as text."""
+    """Search the web and return the top results as text.
+
+    Uses Brave Search API when BRAVE_API_KEY is set, otherwise falls back to
+    DuckDuckGo (which may be rate-limited or captcha'd from server IPs).
+    """
     query = (query or "").strip()
     if not query:
         raise ToolError("عبارت جست‌وجو خالی بود.")
+
+    if config.BRAVE_API_KEY:
+        return await _brave_search(query)
+    return await _duckduckgo_search(query)
+
+
+async def _brave_search(query: str) -> str:
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": config.BRAVE_API_KEY,
+    }
+    url = "https://api.search.brave.com/res/v1/web/search"
+    params = {"q": query, "count": str(MAX_LINKS)}
+    try:
+        timeout = aiohttp.ClientTimeout(total=config.TOOL_TIMEOUT, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status >= 400:
+                    raise ToolError(f"جست‌وجو جواب نداد (کد {resp.status}).")
+                data = await resp.json(content_type=None)
+    except asyncio.TimeoutError as exc:
+        raise ToolError("جست‌وجو دیر جواب داد و قطع شد.") from exc
+    except aiohttp.ClientError as exc:
+        raise ToolError(f"جست‌وجو نشد ({type(exc).__name__}).") from exc
+
+    results = ((data.get("web") or {}).get("results") or [])[:MAX_LINKS]
+    if not results:
+        raise ToolError("نتیجه‌ای برای این عبارت پیدا نشد.")
+    lines = [f"نتایج جست‌وجو برای «{query}»:"]
+    for index, item in enumerate(results, start=1):
+        title = item.get("title") or ""
+        link = item.get("url") or ""
+        body = item.get("description") or ""
+        lines.append(f"{index}. {title}\n   {link}" + (f"\n   {body}" if body else ""))
+    return "\n".join(lines)
+
+
+async def _duckduckgo_search(query: str) -> str:
     from urllib.parse import quote
 
     encoded = quote(query, safe="")
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "fa,en;q=0.8"}
-    url = "https://html.duckduckgo.com/html/?q=" + encoded
+    urls = [
+        "https://lite.duckduckgo.com/lite/?q=" + encoded,
+        "https://html.duckduckgo.com/html/?q=" + encoded,
+    ]
 
     last_error: Exception | None = None
     html_text = ""
-    for attempt in range(2):
-        try:
-            timeout = aiohttp.ClientTimeout(total=config.TOOL_TIMEOUT, connect=10)
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(url) as resp:
-                    if resp.status >= 400:
-                        last_error = ToolError(f"جست‌وجو جواب نداد (کد {resp.status}).")
-                        break
-                    html_text = await resp.text(errors="ignore")
-                    if html_text and len(html_text) > 500:
-                        break
-        except asyncio.TimeoutError as exc:
-            last_error = ToolError("جست‌وجو دیر جواب داد و قطع شد.")
-        except aiohttp.ClientError as exc:
-            last_error = ToolError(f"جست‌وجو نشد ({type(exc).__name__}).")
+    for url in urls:
+        for attempt in range(2):
+            try:
+                timeout = aiohttp.ClientTimeout(total=config.TOOL_TIMEOUT, connect=10)
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(url) as resp:
+                        if resp.status >= 400:
+                            last_error = ToolError(f"جست‌وجو جواب نداد (کد {resp.status}).")
+                            break
+                        html_text = await resp.text(errors="ignore")
+                        if html_text and len(html_text) > 500:
+                            break
+            except asyncio.TimeoutError as exc:
+                last_error = ToolError("جست‌وجو دیر جواب داد و قطع شد.")
+            except aiohttp.ClientError as exc:
+                last_error = ToolError(f"جست‌وجو نشد ({type(exc).__name__}).")
+            if html_text and len(html_text) > 500:
+                break
         if html_text and len(html_text) > 500:
             break
 
     if not (html_text and len(html_text) > 500):
         raise last_error or ToolError("جست‌وجو نشد.")
+
+    # Detect bot challenge pages.
+    low = html_text.lower()
+    if "anomaly" in low or "challenge" in low or "captcha" in low:
+        raise ToolError("موتور جست‌وجو فعلاً درخواست ربات را بلاک کرده است.")
 
     results = await asyncio.to_thread(parse_search, html_text)
     if not results:
@@ -342,7 +396,9 @@ async def web_search(query: str) -> str:
 def _parse_lite(html: str) -> list[tuple[str, str, str]]:
     results: list[tuple[str, str, str]] = []
     seen: set[str] = set()
-    for m in re.finditer(r'<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.S):
+    # DuckDuckGo Lite uses single quotes for class attributes.
+    pattern = r'<a[^>]*href="([^"]+)"[^>]*class=[\"\']result-link[\"\'][^>]*>(.*?)</a>'
+    for m in re.finditer(pattern, html, re.S):
         url = _unwrap(m.group(1))
         if url in seen:
             continue
