@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import io
+import html
 import mimetypes
 import re
 import zipfile
 from pathlib import Path
 
+import config
+
 # Telegram bots can download files up to 20 MB.
-MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_FILE_BYTES = config.MAX_FILE_BYTES
 # Keep prompts (and the SQLite rows) from exploding on huge files.
-MAX_TEXT_CHARS = 60_000
+MAX_TEXT_CHARS = config.FILE_MAX_TEXT_CHARS
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TEXT_SUFFIXES = {
@@ -66,13 +69,21 @@ def _pdf(path: Path) -> str:
         except Exception as exc:
             raise FileError("این PDF رمز عبور دارد و باز نشد.") from exc
     pages: list[str] = []
-    for index, page in enumerate(reader.pages, start=1):
+    used = 0
+    page_count = min(len(reader.pages), 80)
+    for index in range(page_count):
+        page = reader.pages[index]
         try:
             text = page.extract_text() or ""
         except Exception:
             text = ""
         if text.strip():
-            pages.append(f"[صفحه {index}]\n{text}")
+            part = f"[صفحه {index + 1}]\n{_clean(text)}"
+            remaining = MAX_TEXT_CHARS - used
+            if remaining <= 0:
+                break
+            pages.append(part[:remaining])
+            used += len(part)
     return "\n\n".join(pages)
 
 
@@ -152,13 +163,7 @@ def _text(path: Path) -> str:
 
 
 def _unescape(text: str) -> str:
-    return (
-        text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", '"')
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-    )
+    return html.unescape(text)
 
 
 # ------------------------------------------------------------------ public API
@@ -205,13 +210,16 @@ def is_image(filename: str) -> bool:
 
 
 def pdf_to_images(path: Path, max_pages: int = 6, scale: float = 2.0) -> list[bytes]:
-    """Render PDF pages to PNG bytes so a vision model can read scanned docs."""
+    """Render a bounded number of PDF pages to JPEG bytes for vision input."""
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:  # pragma: no cover - dependency is pinned
         raise FileError("تبدیل PDF به تصویر ممکن نیست (کتابخانه نصب نیست).") from exc
 
     images: list[bytes] = []
+    total_bytes = 0
+    max_pages = max(1, min(int(max_pages), config.OCR_MAX_PAGES))
+    scale = max(0.5, min(float(scale), 3.0))
     try:
         doc = pdfium.PdfDocument(str(path))
     except Exception as exc:  # noqa: BLE001
@@ -220,11 +228,85 @@ def pdf_to_images(path: Path, max_pages: int = 6, scale: float = 2.0) -> list[by
     try:
         for index in range(min(len(doc), max_pages)):
             page = doc[index]
-            bitmap = page.render(scale=scale)
-            pil = bitmap.to_pil()
-            buffer = io.BytesIO()
-            pil.save(buffer, format="JPEG", quality=85, optimize=True)
-            images.append(buffer.getvalue())
+            bitmap = None
+            try:
+                width, height = page.get_size()
+                if min(width, height) <= 0 or max(width, height) > 50_000:
+                    raise FileError("ابعاد یکی از صفحه‌های PDF بیش از حد بزرگ است.")
+                page_scale = min(
+                    scale,
+                    config.OCR_MAX_IMAGE_DIM / max(float(width), float(height), 1.0),
+                )
+                bitmap = page.render(scale=page_scale)
+                pil = bitmap.to_pil()
+                pil.thumbnail(
+                    (config.OCR_MAX_IMAGE_DIM, config.OCR_MAX_IMAGE_DIM)
+                )
+
+                encoded: bytes | None = None
+                for quality in (85, 72, 60):
+                    buffer = io.BytesIO()
+                    pil.save(buffer, format="JPEG", quality=quality, optimize=True)
+                    candidate = buffer.getvalue()
+                    encoded = candidate
+                    if len(candidate) <= config.OCR_MAX_IMAGE_BYTES:
+                        break
+                if encoded is None:
+                    continue
+                if total_bytes + len(encoded) > config.OCR_MAX_IMAGE_BYTES:
+                    break
+                images.append(encoded)
+                total_bytes += len(encoded)
+            finally:
+                close_bitmap = getattr(bitmap, "close", None)
+                if close_bitmap:
+                    close_bitmap()
+                close_page = getattr(page, "close", None)
+                if close_page:
+                    close_page()
     finally:
         doc.close()
+    if not images:
+        raise FileError("هیچ صفحه‌ای از این PDF برای خواندن تصویر تولید نشد.")
     return images
+
+
+def optimize_image(raw: bytes) -> bytes:
+    """Resize/compress a Telegram image before embedding it as base64."""
+    if len(raw) <= config.IMAGE_MAX_BYTES:
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(raw)) as image:
+                if max(image.size) <= config.IMAGE_MAX_DIM:
+                    return raw
+        except Exception:
+            return raw
+
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.width * image.height > 60_000_000:
+                raise FileError("ابعاد تصویر برای پردازش بیش از حد بزرگ است.")
+            if image.mode in ("RGBA", "LA"):
+                background = Image.new("RGB", image.size, "white")
+                alpha = image.getchannel("A")
+                background.paste(image, mask=alpha)
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.thumbnail((config.IMAGE_MAX_DIM, config.IMAGE_MAX_DIM))
+
+            encoded = raw
+            for quality in (85, 72, 60):
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=quality, optimize=True)
+                encoded = buffer.getvalue()
+                if len(encoded) <= config.IMAGE_MAX_BYTES:
+                    break
+            return encoded
+    except FileError:
+        raise
+    except Exception:
+        return raw

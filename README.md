@@ -79,8 +79,11 @@ cp .env.example .env    # مقادیر را پر کن
 | `TOOL_MAX_ROUNDS` | `2` | حداکثر دور صدا زدن ابزار در یک پاسخ |
 | `TOOL_TIMEOUT` | `20` | مهلت هر ابزار (ثانیه) |
 | `TOOL_MAX_CHARS` | `24000` | سقف متن برگشتی از لینک/فایل |
+| `TOOL_RESULT_MAX_CHARS` | `6000` | سقف نتیجهٔ هر ابزار داخل context مدل |
 | `MAX_TOKENS` | `8192` | سقف توکن پاسخ |
 | `CONTEXT_MAX_CHARS` | `24000` | سقف کاراکتر تاریخچه در هر درخواست |
+| `SUMMARY_INPUT_MAX_CHARS` | `48000` | سقف متن ورودی خلاصه‌ساز |
+| `HISTORY_ATTACHMENT_MAX_CHARS` | `12000` | سقف متن فایل ذخیره‌شده در history |
 | `HISTORY_MAX_MESSAGES` | `60` | آستانهٔ خلاصه‌سازی خودکار |
 | `HISTORY_KEEP_MESSAGES` | `20` | چند پیام تازه بعد از خلاصه‌سازی بماند |
 | `EDIT_INTERVAL` | `1.2` | فاصلهٔ ادیت پیام استریم (ثانیه) |
@@ -88,6 +91,8 @@ cp .env.example .env    # مقادیر را پر کن
 | `RATE_MAX_MESSAGES` | `8` | سقف پیام کاربر در `RATE_WINDOW` (پیش‌فرض ۱۰ ثانیه) |
 | `SYSTEM_PROMPT` | (متن پیش‌فرض در `config.py`) | جایگزینی کامل شخصیت؛ خالی = پیش‌فرض |
 | `DEBUG` | خالی | `1` = لاگ کامل آپدیت‌ها |
+
+برای OCR و تصاویر هم `OCR_MAX_PAGES`، `OCR_MAX_IMAGE_BYTES`، `OCR_MAX_IMAGE_DIM`، `IMAGE_MAX_BYTES` و `IMAGE_MAX_DIM` قابل تنظیم‌اند؛ پیش‌فرض‌ها برای جلوگیری از درخواست‌های سنگین مناسب‌اند.
 
 ### نمونهٔ کامل `.env`
 

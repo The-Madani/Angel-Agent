@@ -53,18 +53,29 @@ def md_to_html(text: str) -> str:
 
 
 def split_parts(text: str, limit: int = config.MESSAGE_CHUNK_LIMIT) -> list[str]:
-    if len(text) <= limit:
+    limit = max(1, limit)
+    if len(text.encode("utf-16-le")) // 2 <= limit:
         return [text]
     parts: list[str] = []
     rest = text
-    while len(rest) > limit:
-        cut = rest.rfind("\n", 0, limit)
-        if cut < limit // 3:
-            cut = rest.rfind(" ", 0, limit)
-        if cut < limit // 3:
-            cut = limit
-        parts.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip("\n")
+    while len(rest.encode("utf-16-le")) // 2 > limit:
+        units = 0
+        hard_cut = 0
+        for index, char in enumerate(rest):
+            next_units = units + (2 if ord(char) > 0xFFFF else 1)
+            if next_units > limit:
+                break
+            units = next_units
+            hard_cut = index + 1
+        cut = rest.rfind("\n", 0, hard_cut)
+        if cut < hard_cut // 3:
+            cut = rest.rfind(" ", 0, hard_cut)
+        if cut < hard_cut // 3:
+            boundary = hard_cut
+        else:
+            boundary = cut + 1
+        parts.append(rest[:boundary])
+        rest = rest[boundary:]
     if rest:
         parts.append(rest)
     return parts
@@ -83,6 +94,7 @@ class TelegramStreamer:
         self._placeholder: Message | None = None
         self._answer_started = False
         self._typing_task: asyncio.Task | None = None
+        self._thinking_task: asyncio.Task | None = None
         self._stopped = asyncio.Event()
         self.answer = ""
         self.reasoning_chars = 0
@@ -96,6 +108,7 @@ class TelegramStreamer:
     ) -> str:
         self._stopped.clear()
         self._typing_task = asyncio.create_task(self._typing_loop())
+        self._thinking_task = asyncio.create_task(self._thinking_loop())
         started = time.monotonic()
         try:
             await self._typing()
@@ -153,6 +166,38 @@ class TelegramStreamer:
             if self._typing_task:
                 self._typing_task.cancel()
                 await asyncio.gather(self._typing_task, return_exceptions=True)
+            if self._thinking_task:
+                self._thinking_task.cancel()
+                await asyncio.gather(self._thinking_task, return_exceptions=True)
+
+    async def prepare_next_round(self) -> None:
+        """Reset model-output state before a follow-up tool round.
+
+        A tool loop uses one Telegram message surface, but every model pass
+        must have independent buffers and usage counters. Keep the first
+        message so a thinking placeholder or partial answer can be replaced;
+        remove additional chunks that may have been sent before the tool call.
+        """
+        for message in self._messages[1:]:
+            try:
+                await message.delete()
+            except Exception:
+                log.debug("could not remove stale streamed chunk in chat %s", self.chat_id)
+        self._messages = self._messages[:1]
+        self._rendered = self._rendered[:1]
+        self._chunks.clear()
+        self._answer_started = False
+        self._last_edit = 0.0
+        self.answer = ""
+        self.reasoning_chars = 0
+        self.usage = None
+        self.error = None
+        self.tool_calls = []
+
+    async def show_error(self, text: str = ERROR_TEXT) -> None:
+        """Replace a pending thinking hint when the caller has no answer."""
+        self.error = "empty answer"
+        await self._replace_placeholder(text)
 
     # ------------------------------------------------------------------ typing
     async def _typing(self) -> None:
@@ -168,12 +213,34 @@ class TelegramStreamer:
                 return
             except asyncio.TimeoutError:
                 pass
-            await self._typing()
+            try:
+                await self._typing()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("typing action failed in chat %s", self.chat_id, exc_info=True)
+
+    async def _thinking_loop(self) -> None:
+        try:
+            await asyncio.sleep(config.THINKING_HINT_DELAY)
+            if not self._answer_started and self._placeholder is None:
+                await self._send_placeholder()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("thinking hint failed in chat %s", self.chat_id, exc_info=True)
 
     # --------------------------------------------------------------- rendering
     async def _send_placeholder(self) -> None:
         try:
-            self._placeholder = await self._send(THINKING_TEXT)
+            placeholder = await self._send(THINKING_TEXT)
+            if self._answer_started:
+                try:
+                    await placeholder.delete()
+                except Exception:
+                    log.debug("could not remove late thinking hint in chat %s", self.chat_id)
+                return
+            self._placeholder = placeholder
             self._messages = [self._placeholder]
             self._rendered = [THINKING_TEXT]
         except RPCError:

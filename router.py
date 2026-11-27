@@ -37,7 +37,11 @@ class Router:
         if self._session and not self._session.closed:
             return
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=config.REQUEST_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(
+                total=config.REQUEST_TIMEOUT,
+                connect=min(15.0, config.REQUEST_TIMEOUT),
+                sock_read=config.REQUEST_TIMEOUT,
+            ),
             connector=aiohttp.TCPConnector(
                 limit=config.MAX_CONCURRENT * 2,
                 limit_per_host=config.MAX_CONCURRENT,
@@ -133,6 +137,8 @@ class Router:
                         yield ("tool_calls", calls)
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError as exc:
+                raise RouterError("request timed out") from exc
             except aiohttp.ClientError as exc:
                 raise RouterError(f"connection error: {exc}") from exc
 
@@ -165,10 +171,16 @@ class Router:
                 if not choices:
                     raise RouterError("empty choices")
                 content = (choices[0].get("message") or {}).get("content") or ""
-                return content.strip()
+                if isinstance(content, list):
+                    content = "".join(
+                        str(part.get("text") or "")
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+                return str(content).strip()
             except asyncio.CancelledError:
                 raise
-            except (RouterError, aiohttp.ClientError, ValueError) as exc:
+            except (asyncio.TimeoutError, RouterError, aiohttp.ClientError, ValueError) as exc:
                 last_error = exc
                 if attempt < retries:
                     await asyncio.sleep(0.8 * (attempt + 1))

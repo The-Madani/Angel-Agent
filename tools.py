@@ -11,11 +11,12 @@ import html as _html
 import ipaddress
 import json
 import logging
+import math
 import re
+import socket
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import aiohttp
 
@@ -89,15 +90,32 @@ def _strip_tags(html: str) -> str:
 
 
 def _is_private(host: str) -> bool:
+    host = (host or "").strip().strip("[]").rstrip(".").lower()
     if not host or host in BLOCKED_HOSTS:
         return True
-    # Only block literal IP addresses; resolving hostnames is flaky in some
-    # environments and would wrongly block legitimate sites.
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return bool(addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
+    return not addr.is_global
+
+
+async def _assert_public_host(host: str) -> None:
+    """Reject literal and DNS-resolved private addresses before fetching."""
+    if _is_private(host):
+        raise ToolError("این آدرس داخلی است و اجازهٔ دسترسی ندارم.")
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ToolError("دامنه پیدا نشد.") from exc
+    addresses = {str(info[4][0]) for info in infos if info[4]}
+    if not addresses or any(_is_private(address) for address in addresses):
+        raise ToolError("این آدرس داخلی است و اجازهٔ دسترسی ندارم.")
 
 
 def normalize_url(url: str) -> str:
@@ -112,6 +130,8 @@ def normalize_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ToolError("لینک معتبر نبود.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ToolError("لینک‌های دارای نام کاربری یا رمز عبور قابل خواندن نیستند.")
     return url
 
 
@@ -146,13 +166,20 @@ def _pdf(raw: bytes) -> str:
         except Exception as exc:  # noqa: BLE001
             raise ToolError("این PDF رمز عبور دارد و باز نشد.") from exc
     pages: list[str] = []
-    for index, page in enumerate(reader.pages[:80], start=1):
+    used = 0
+    for index in range(min(len(reader.pages), 80)):
+        page = reader.pages[index]
         try:
             body = page.extract_text() or ""
         except Exception:  # noqa: BLE001
             body = ""
         if body.strip():
-            pages.append(f"[صفحه {index}]\n{body.strip()}")
+            part = f"[صفحه {index + 1}]\n{body.strip()}"
+            remaining = MAX_PAGE_CHARS - used
+            if remaining <= 0:
+                break
+            pages.append(part[:remaining])
+            used += len(part)
     if not pages:
         raise ToolError("متنی داخل این PDF پیدا نشد (احتمالاً اسکن‌شده است).")
     return "\n\n".join(pages)
@@ -187,35 +214,51 @@ async def read_link(url: str) -> str:
     url = normalize_url(url)
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if "wikipedia.org" in host and parsed.path.startswith("/wiki/"):
+    if (host == "wikipedia.org" or host.endswith(".wikipedia.org")) and parsed.path.startswith("/wiki/"):
         title = unquote(parsed.path[len("/wiki/"):]).replace("_", " ")
         if title:
+            await _assert_public_host(host)
             return await _wikipedia(host, title)
 
-    if await asyncio.to_thread(_is_private, host):
-        raise ToolError("این آدرس داخلی است و اجازهٔ دسترسی ندارم.")
+    await _assert_public_host(host)
 
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "fa,en;q=0.8"}
     try:
         timeout = aiohttp.ClientTimeout(total=TIMEOUT, connect=10)
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                final = str(resp.url)
-                if await asyncio.to_thread(_is_private, urlparse(final).hostname or ""):
-                    raise ToolError("این آدرس داخلی است و اجازهٔ دسترسی ندارم.")
-                content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                if resp.status >= 400:
-                    raise ToolError(f"سایت جواب نداد (کد {resp.status}).")
-                raw = await resp.read()
-                if len(raw) > MAX_URL_BYTES:
-                    raise ToolError("صفحه خیلی بزرگ بود.")
+            current = url
+            for _ in range(6):
+                current_url = urlparse(current)
+                if current_url.scheme not in ("http", "https") or not current_url.hostname:
+                    raise ToolError("لینک به یک آدرس قابل خواندن redirect نشد.")
+                await _assert_public_host(current_url.hostname)
+                async with session.get(current, allow_redirects=False) as resp:
+                    if 300 <= resp.status < 400:
+                        location = resp.headers.get("Location")
+                        if not location:
+                            raise ToolError("لینک redirect ناقص بود.")
+                        current = normalize_url(urljoin(current, location))
+                        continue
+                    final = str(resp.url)
+                    final_url = urlparse(final)
+                    await _assert_public_host(final_url.hostname or "")
+                    content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                    if resp.status >= 400:
+                        raise ToolError(f"سایت جواب نداد (کد {resp.status}).")
+                    raw = await resp.content.read(MAX_URL_BYTES + 1)
+                    if len(raw) > MAX_URL_BYTES:
+                        raise ToolError("صفحه خیلی بزرگ بود.")
+                    break
+            else:
+                raise ToolError("تعداد redirectهای لینک بیش از حد بود.")
     except asyncio.TimeoutError as exc:
         raise ToolError("سایت دیر جواب داد و قطع شد.") from exc
     except aiohttp.ClientError as exc:
         raise ToolError(f"اتصال به سایت نشد ({type(exc).__name__}).") from exc
 
     title = ""
-    if content_type == "application/pdf" or url.lower().endswith(".pdf"):
+    is_pdf = content_type == "application/pdf" or final_url.path.lower().endswith(".pdf")
+    if is_pdf:
         body = await asyncio.to_thread(_pdf, raw)
     elif content_type.startswith("image/"):
         raise ToolError("این لینک یک عکس است؛ متن ندارد. از کاربر بخواه خودش عکس را بفرستد.")
@@ -227,7 +270,7 @@ async def read_link(url: str) -> str:
     ):
         raise ToolError(f"این نوع فایل ({content_type}) را نمی‌توانم بخوانم.")
 
-    if content_type != "application/pdf":
+    if not is_pdf:
         text = _decode(raw, content_type)
         if content_type in ("text/html", "application/xhtml+xml", "") or "<html" in text[:400].lower():
             title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
@@ -245,40 +288,6 @@ async def read_link(url: str) -> str:
 
 
 # ---------------------------------------------------------------------- search
-def _clean_snippet(html: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
-
-
-def _unwrap(href: str) -> str:
-    if href.startswith("//duckduckgo.com/l/") or "uddg=" in href:
-        query = parse_qs(urlparse("https:" + href if href.startswith("//") else href).query)
-        target = (query.get("uddg") or [""])[0]
-        if target:
-            return unquote(target)
-    return "https:" + href if href.startswith("//") else href
-
-
-def parse_search(html: str) -> list[tuple[str, str, str]]:
-    results: list[tuple[str, str, str]] = []
-    seen: set[str] = set()
-    blocks = re.split(r'class="result results_links', html)
-    for block in blocks[1:]:
-        link = re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
-        if not link:
-            continue
-        url = _unwrap(link.group(1))
-        if url in seen:
-            continue
-        seen.add(url)
-        title = _clean_snippet(link.group(2))
-        snippet = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', block, re.S)
-        body = _clean_snippet(snippet.group(1)) if snippet else ""
-        results.append((title, url, body))
-        if len(results) >= MAX_LINKS:
-            break
-    return results
-
-
 async def web_search(query: str) -> str:
     """Search the web via the 9router /search endpoint (tinyfish)."""
     query = (query or "").strip()
@@ -309,15 +318,28 @@ async def web_search(query: str) -> str:
     except aiohttp.ClientError as exc:
         raise ToolError(f"جست‌وجو نشد ({type(exc).__name__}).") from exc
 
-    results = data.get("results") or []
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        results = []
     if not results:
         raise ToolError("نتیجه‌ای برای این عبارت پیدا نشد.")
     lines = [f"نتایج جست‌وجو برای «{query}»:"]
-    for index, item in enumerate(results[:MAX_LINKS], start=1):
-        title = item.get("title") or ""
-        link = item.get("url") or ""
-        body = item.get("snippet") or ""
+    valid = 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        title = _clip(str(item.get("title") or ""))[:500]
+        link = str(item.get("url") or "").strip()
+        body = _clip(str(item.get("snippet") or ""))[:800]
+        if not title and not link:
+            continue
+        valid += 1
+        index = valid
         lines.append(f"{index}. {title}\n   {link}" + (f"\n   {body}" if body else ""))
+        if valid >= MAX_LINKS:
+            break
+    if not valid:
+        raise ToolError("نتیجهٔ قابل استفاده‌ای پیدا نشد.")
     return "\n".join(lines)
 
 
@@ -429,6 +451,7 @@ SCHEMAS: list[dict] = [
                     "minutes_from_now": {"type": "integer", "description": "چند دقیقه دیگر"},
                     "iso_time": {"type": "string", "description": "زمان دقیق ISO (2026-11-27T18:00)"},
                 },
+                "required": ["text"],
             },
         },
     },
@@ -465,34 +488,40 @@ async def call(name: str, arguments: str, chat_id: int = 0) -> str:
         data = json.loads(arguments or "{}")
         if not isinstance(data, dict):
             raise ToolError("ورودی ابزار نامعتبر بود.")
-    except (ValueError, ToolError):
+    except (TypeError, ValueError, ToolError):
         return "خطا: ورودی ابزار JSON نامعتبر بود."
 
     try:
-        if name == "read_link":
-            return await read_link(str(data.get("url") or ""))
-        if name == "web_search":
-            return await web_search(str(data.get("query") or ""))
-        if name == "get_time":
-            return get_time()
-        if name == "remember_fact":
-            return remember_fact(chat_id, str(data.get("key") or ""), str(data.get("value") or ""))
-        if name == "recall_facts":
-            return recall_facts(chat_id)
-        if name == "forget_fact":
-            return forget_fact(chat_id, str(data.get("key") or ""))
-        if name == "search_history":
-            return search_history(chat_id, str(data.get("query") or ""))
-        if name == "set_reminder":
-            return await set_reminder(chat_id, data)
-        if name == "list_reminders":
-            return list_reminders(chat_id)
-        return f"خطا: ابزار «{name}» وجود ندارد."
+        return await asyncio.wait_for(_dispatch(name, data, chat_id), timeout=TIMEOUT)
+    except asyncio.TimeoutError:
+        return "خطا: اجرای ابزار طول کشید و متوقف شد."
     except ToolError as exc:
         return f"خطا: {exc}"
     except Exception:  # noqa: BLE001 - a tool must never kill the chat
         log.exception("tool %s failed", name)
         return "خطا: اجرای این ابزار نشد."
+
+
+async def _dispatch(name: str, data: dict, chat_id: int) -> str:
+    if name == "read_link":
+        return await read_link(str(data.get("url") or ""))
+    if name == "web_search":
+        return await web_search(str(data.get("query") or ""))
+    if name == "get_time":
+        return get_time()
+    if name == "remember_fact":
+        return remember_fact(chat_id, str(data.get("key") or ""), str(data.get("value") or ""))
+    if name == "recall_facts":
+        return recall_facts(chat_id)
+    if name == "forget_fact":
+        return forget_fact(chat_id, str(data.get("key") or ""))
+    if name == "search_history":
+        return search_history(chat_id, str(data.get("query") or ""))
+    if name == "set_reminder":
+        return await set_reminder(chat_id, data)
+    if name == "list_reminders":
+        return list_reminders(chat_id)
+    return f"خطا: ابزار «{name}» وجود ندارد."
 
 
 def describe(call_name: str, arguments: str) -> str:
@@ -557,7 +586,7 @@ def search_history(chat_id: int, query: str) -> str:
     lines = [f"نتایج آرشیو برای «{query}»:"]
     for i, (role, content, ts) in enumerate(rows, 1):
         who = "کاربر" if role == "user" else "ربات"
-        stamp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        stamp = datetime.fromtimestamp(ts, TEHRAN).strftime("%Y-%m-%d %H:%M")
         lines.append(f"{i}. [{stamp}] {who}: {content[:200]}")
     return "\n".join(lines)
 
@@ -571,19 +600,29 @@ async def set_reminder(chat_id: int, data: dict) -> str:
     now = int(time.time())
     due = 0
     minutes = data.get("minutes_from_now")
-    if isinstance(minutes, (int, float)) and minutes > 0:
-        due = now + int(minutes * 60)
-    else:
+    if minutes is not None and not isinstance(minutes, bool):
+        try:
+            minutes_value = float(minutes)
+        except (TypeError, ValueError):
+            minutes_value = 0.0
+        if math.isfinite(minutes_value) and minutes_value > 0:
+            due = now + int(minutes_value * 60)
+    if due <= 0:
         iso = str(data.get("iso_time") or "").strip()
         if iso:
             try:
-                due = int(datetime.fromisoformat(iso).timestamp())
-            except ValueError:
+                parsed = datetime.fromisoformat(iso)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=TEHRAN)
+                else:
+                    parsed = parsed.astimezone(TEHRAN)
+                due = int(parsed.timestamp())
+            except (ValueError, OverflowError):
                 return "خطا: زمان ISO نامعتبر بود."
-    if due <= 0:
+    if due <= now:
         return "خطا: زمان یادآور مشخص نشد (minutes_from_now یا iso_time لازم است)."
     rid = _MEMORY.add_reminder(chat_id, text, due)
-    when = datetime.fromtimestamp(due).strftime("%Y-%m-%d %H:%M")
+    when = datetime.fromtimestamp(due, TEHRAN).strftime("%Y-%m-%d %H:%M")
     return f"یادآور #{rid} تنظیم شد: «{text[:80]}» — {when}"
 
 
@@ -595,6 +634,6 @@ def list_reminders(chat_id: int) -> str:
         return "هیچ یادآور فعالی نداری."
     lines = ["یادآورهای فعال:"]
     for rid, text, due in items:
-        when = datetime.fromtimestamp(due).strftime("%Y-%m-%d %H:%M")
+        when = datetime.fromtimestamp(due, TEHRAN).strftime("%Y-%m-%d %H:%M")
         lines.append(f"• #{rid} — {when} — {text[:80]}")
     return "\n".join(lines)

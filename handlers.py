@@ -58,7 +58,9 @@ ADMIN_HELP = """
 
 RATE_WARNING = "یه کم آرومتر 🙂"
 QUOTE_MAX_CHARS = 20_000
-TOOL_RESULT_MAX = 12_000
+TOOL_RESULT_MAX = min(
+    config.TOOL_RESULT_MAX_CHARS, max(2_000, config.CONTEXT_MAX_CHARS // 4)
+)
 TOOL_TZ = timezone(timedelta(hours=3, minutes=30), "Asia/Tehran")
 
 
@@ -71,6 +73,7 @@ class BotHandlers:
         compactor: Compactor,
         backups: BackupManager,
         username: str,
+        maintenance_lock: asyncio.Lock | None = None,
     ) -> None:
         self.client = client
         self.memory = memory
@@ -84,7 +87,9 @@ class BotHandlers:
         self._rate: dict[int, deque[float]] = {}
         self._rate_warned: dict[int, float] = {}
         self._mention = re.compile(re.escape(f"@{username}"), re.IGNORECASE) if username else None
-        self._restore_until = 0.0
+        self._restore_until: dict[tuple[int, int], float] = {}
+        self._maintenance_lock = maintenance_lock or asyncio.Lock()
+        self._maintenance = False
         self.handled = 0
         tools.set_memory(memory)
 
@@ -110,6 +115,10 @@ class BotHandlers:
         text = (message.text or "").strip()
         caption = (message.caption or "").strip()
         if not text and not message.document and not message.photo:
+            return
+
+        if self._maintenance:
+            await self._reply(message, "⏳ در حال بازگردانی اطلاعات؛ چند لحظه صبر کن.")
             return
 
         if text.startswith("/"):
@@ -194,6 +203,7 @@ class BotHandlers:
             attachment.extend(doc_images)
             question = text or caption or "این فایل رو بخون و خلاصه‌اش رو بگو."
             text = f"فایل «{name}» رو فرستادم. {question}\n\n--- محتوای فایل ---\n{body}"
+            stored = self._history_excerpt(text)
         elif message.photo is not None:
             raw = await self._photo_bytes(client, message)
             if raw is None:
@@ -260,36 +270,39 @@ class BotHandlers:
                 downloaded = await client.download_media(message, file_name=str(path))
                 if not downloaded:
                     raise files.FileError("فایل دانلود نشد.")
-                body = await asyncio.to_thread(files.extract_text, Path(downloaded), name)
-        except files.FileError as exc:
-            # A scanned PDF has no text layer: render the pages and let the
-            # vision model read them instead.
-            if Path(name).suffix.lower() == ".pdf":
+                downloaded_path = Path(downloaded)
+                actual_size = await asyncio.to_thread(
+                    lambda: downloaded_path.stat().st_size
+                )
+                if actual_size > files.MAX_FILE_BYTES:
+                    raise files.FileError("فایل بزرگ‌تر از ۲۰ مگابایت است.")
+
                 try:
-                    with tempfile.TemporaryDirectory() as tmp:
-                        path = Path(tmp) / self._safe_name(name)
-                        downloaded = await client.download_media(
-                            message, file_name=str(path)
+                    body = await asyncio.to_thread(
+                        files.extract_text, downloaded_path, name
+                    )
+                except files.UnsupportedFile as exc:
+                    if report:
+                        await self._reply(
+                            message,
+                            f"⚠️ {exc}\nفرمت‌های پشتیبانی‌شده: {files.SUPPORTED_HINT}.",
                         )
-                        if downloaded:
-                            pages = await asyncio.to_thread(
-                                files.pdf_to_images, Path(downloaded)
-                            )
-                            if pages:
-                                images = [self._image_part(p) for p in pages]
-                                note = (
-                                    f"[این PDF متن قابل استخراج نداشت؛ {len(pages)} صفحهٔ اول "
-                                    "به‌صورت تصویر فرستاده شد — متنشان را از روی تصویر بخوان]"
-                                )
-                                return name, note, images
-                except Exception:
-                    log.warning("pdf->images failed in chat %s", message.chat.id, exc_info=True)
+                    return None
+                except files.FileError as exc:
+                    # A scanned PDF has no text layer: render the same local
+                    # download and let the vision model read its pages.
+                    if Path(name).suffix.lower() != ".pdf":
+                        raise
+                    pages = await asyncio.to_thread(files.pdf_to_images, downloaded_path)
+                    images = [self._image_part(page) for page in pages]
+                    note = (
+                        f"[این PDF متن قابل استخراج نداشت؛ {len(pages)} صفحهٔ اول "
+                        "به‌صورت تصویر فرستاده شد — متنشان را از روی تصویر بخوان]"
+                    )
+                    return name, note, images
+        except files.FileError as exc:
             if report:
                 await self._reply(message, f"⚠️ {exc}")
-            return None
-        except files.UnsupportedFile as exc:
-            if report:
-                await self._reply(message, f"⚠️ {exc}\nفرمت‌های پشتیبانی‌شده: {files.SUPPORTED_HINT}.")
             return None
         except Exception:
             log.exception("reading document failed in chat %s", message.chat.id)
@@ -322,7 +335,12 @@ class BotHandlers:
             if report:
                 await self._reply(message, "⚠️ عکس خیلی بزرگه.")
             return None
-        return raw
+        try:
+            return await asyncio.to_thread(files.optimize_image, raw)
+        except files.FileError as exc:
+            if report:
+                await self._reply(message, f"⚠️ {exc}")
+            return None
 
     @staticmethod
     def _image_part(raw: bytes) -> dict:
@@ -330,6 +348,27 @@ class BotHandlers:
             "type": "image_url",
             "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(raw).decode()},
         }
+
+    @staticmethod
+    def _history_excerpt(text: str) -> str:
+        if len(text) <= config.HISTORY_ATTACHMENT_MAX_CHARS:
+            return text
+        limit = config.HISTORY_ATTACHMENT_MAX_CHARS
+        return text[:limit].rstrip() + "\n[… ادامهٔ فایل فقط در همان درخواست پردازش شد]"
+
+    @staticmethod
+    def _request_excerpt(text: str) -> str:
+        """Keep the user question and bounded file text inside the context."""
+        limit = max(2_000, config.CONTEXT_MAX_CHARS - 2_000)
+        if len(text) <= limit:
+            return text
+        head = int(limit * 0.78)
+        tail = limit - head
+        return (
+            text[:head].rstrip()
+            + "\n[… میانهٔ متن برای رعایت سقف درخواست حذف شد …]\n"
+            + text[-tail:].lstrip()
+        )
 
     @staticmethod
     def _safe_name(name: str) -> str:
@@ -350,37 +389,51 @@ class BotHandlers:
         started = time.perf_counter()
         msg_id = self.memory.add_message(chat_id, "user", stored or text)
         streamer = TelegramStreamer(client, chat_id)
-        request_messages = self._build_messages(chat_id, attachment)
+        request_messages = self._build_messages(
+            chat_id, attachment, current_text=text
+        )
 
         prompt_tokens = 0
         completion_tokens = 0
         reasoning_tokens = 0
+        reasoning_chars = 0
         rounds = 0
-        saw_usage = False
+        answer = ""
 
         try:
             while True:
+                if rounds:
+                    await streamer.prepare_next_round()
                 allow_tools = bool(config.TOOLS_ENABLED) and rounds < config.TOOL_MAX_ROUNDS
                 answer = await streamer.run(
                     self.router.stream(
                         request_messages, tools=tools.SCHEMAS if allow_tools else None
                     ),
-                    allow_empty=allow_tools,
+                    # A tool-only model pass has no visible content. Let the
+                    # handler inspect tool_calls before deciding whether it
+                    # was a valid empty pass or a real failure.
+                    allow_empty=bool(config.TOOLS_ENABLED),
                 )
 
                 usage = streamer.usage or {}
                 if usage:
-                    saw_usage = True
                     details = usage.get("completion_tokens_details") or {}
                     prompt_tokens += int(usage.get("prompt_tokens") or 0)
                     completion_tokens += int(usage.get("completion_tokens") or 0)
                     reasoning_tokens += int(
                         usage.get("reasoning_tokens") or details.get("reasoning_tokens") or 0
                     )
+                else:
+                    prompt_tokens += estimate_tokens(request_messages)
+                    if answer:
+                        completion_tokens += estimate_tokens(answer)
+                reasoning_chars += streamer.reasoning_chars
 
-                calls = streamer.tool_calls
-                streamer.tool_calls = []
+                calls = list(streamer.tool_calls)
                 if not calls:
+                    break
+                if not allow_tools:
+                    log.warning("model returned tool calls after tool budget in chat %s", chat_id)
                     break
 
                 rounds += 1
@@ -414,15 +467,16 @@ class BotHandlers:
         if not answer.strip():
             self.memory.delete_message(msg_id)
             if not streamer.error:
-                await self._reply(message, "⚠️ پاسخی تولید نشد. دوباره بفرست.")
+                await streamer.show_error("⚠️ پاسخی تولید نشد. دوباره بفرست.")
             return
 
         self.memory.add_message(chat_id, "assistant", answer)
 
-        if not saw_usage:
+        if prompt_tokens <= 0:
             prompt_tokens = estimate_tokens(request_messages)
+        if completion_tokens <= 0:
             completion_tokens = estimate_tokens(answer)
-        reasoning_tokens = reasoning_tokens or streamer.reasoning_chars // 3
+        reasoning_tokens = reasoning_tokens or reasoning_chars // 3
 
         self.memory.bump_stats(
             chat_id,
@@ -434,9 +488,15 @@ class BotHandlers:
         self.compactor.schedule(chat_id)
 
     def _build_messages(
-        self, chat_id: int, attachment: list[dict] | None = None
+        self,
+        chat_id: int,
+        attachment: list[dict] | None = None,
+        current_text: str | None = None,
     ) -> list[dict]:
-        summary, recent = self.memory.get_context(chat_id, config.CONTEXT_MAX_CHARS)
+        history_budget = config.CONTEXT_MAX_CHARS
+        if current_text is not None:
+            history_budget -= len(self._request_excerpt(current_text))
+        summary, recent = self.memory.get_context(chat_id, history_budget)
         messages: list[dict] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
 
         now = datetime.now(TOOL_TZ).strftime("%Y-%m-%d %H:%M")
@@ -456,6 +516,12 @@ class BotHandlers:
                 {"role": "system", "content": "خلاصهٔ گفتگوهای قبلی (برای زمینه):\n" + summary}
             )
         messages.extend(recent)
+        if current_text is not None:
+            current_text = self._request_excerpt(current_text)
+            if messages and messages[-1].get("role") == "user":
+                messages[-1] = {"role": "user", "content": current_text}
+            else:
+                messages.append({"role": "user", "content": current_text})
         if attachment:
             if messages and messages[-1].get("role") == "user":
                 messages[-1] = {
@@ -486,6 +552,7 @@ class BotHandlers:
             )
 
         out = [*messages, assistant]
+        result_limit = max(1_000, min(TOOL_RESULT_MAX, config.CONTEXT_MAX_CHARS // max(2, len(calls) * 2)))
         for call in assistant["tool_calls"]:
             fn = call["function"]
             result = await tools.call(fn["name"], fn["arguments"], chat_id=chat_id)
@@ -493,7 +560,7 @@ class BotHandlers:
                 {
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": result[:TOOL_RESULT_MAX],
+                    "content": result[:result_limit],
                 }
             )
         return out
@@ -655,8 +722,9 @@ class BotHandlers:
         if not self.backups.enabled:
             await self._reply(message, "بکاپ گیت‌هاب تنظیم نشده.")
             return
+        confirmation_key = (message.chat.id, message.from_user.id)
         if arg != "confirm":
-            self._restore_until = time.monotonic() + 120
+            self._restore_until[confirmation_key] = time.monotonic() + 120
             await self._reply(
                 message,
                 (
@@ -666,16 +734,18 @@ class BotHandlers:
                 ),
             )
             return
-        if time.monotonic() > self._restore_until:
+        deadline = self._restore_until.pop(confirmation_key, 0.0)
+        if time.monotonic() > deadline:
             await self._reply(message, "⌛️ زمان تأیید تمام شد. دوباره /restore را بزن.")
             return
-        self._restore_until = 0.0
 
+        self._maintenance = True
         await self._reply(message, "⏳ در حال دانلود و بازگردانی…")
         await self._cancel_all()
-        self.compactor.cancel_pending()
         try:
-            result = await self.backups.restore_latest()
+            await self.compactor.cancel_pending()
+            async with self._maintenance_lock:
+                result = await self.backups.restore_latest()
         except BackupError as exc:
             log.warning("restore failed: %s", exc)
             await self._reply(message, f"⚠️ بازگردانی نشد: {exc}")
@@ -684,6 +754,8 @@ class BotHandlers:
             log.exception("restore failed")
             await self._reply(message, "⚠️ بازگردانی ناموفق بود.")
             return
+        finally:
+            self._maintenance = False
 
         await self._reply(
             message,

@@ -29,10 +29,13 @@ class Compactor:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def cancel_pending(self) -> None:
-        for task in list(self._tasks):
+    async def cancel_pending(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
             task.cancel()
         self._tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def compact(self, chat_id: int, *, force: bool = False) -> dict[str, int] | None:
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
@@ -51,10 +54,16 @@ class Compactor:
             if len(rows) < config.HISTORY_MIN_TO_COMPACT:
                 return None
 
-            transcript = "\n".join(
-                f"{'کاربر' if role == 'user' else 'دستیار'}: {content[:MAX_MSG_CHARS]}"
-                for _, role, content in rows
-            )
+            transcript_parts: list[str] = []
+            transcript_chars = 0
+            for _, role, content in rows:
+                part = f"{'کاربر' if role == 'user' else 'دستیار'}: {content[:MAX_MSG_CHARS]}"
+                remaining = config.SUMMARY_INPUT_MAX_CHARS - transcript_chars
+                if remaining <= 0:
+                    break
+                transcript_parts.append(part[:remaining])
+                transcript_chars += len(part)
+            transcript = "\n".join(transcript_parts)
             old_summary = self.memory.summary(chat_id) or "(خالی)"
             prompt = prompts.SUMMARY_INSTRUCTION.format(
                 old_summary=old_summary, transcript=transcript

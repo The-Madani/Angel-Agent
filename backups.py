@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -78,9 +79,12 @@ class BackupManager:
         return bool(self._ready and self.repo and self.token and self.passphrase)
 
     async def start(self) -> None:
+        if self._session and not self._session.closed:
+            self._ready = True
+            return
         if not (self.repo and self.token and self.passphrase):
             return
-        if "/" not in self.repo:
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", self.repo):
             raise BackupError("GITHUB_BACKUP_REPO باید به شکل owner/repo باشد")
         if len(self.passphrase) < 10:
             raise BackupError("BACKUP_PASSPHRASE باید حداقل ۱۰ کاراکتر باشد")
@@ -121,8 +125,16 @@ class BackupManager:
                 f"https://uploads.github.com/repos/{self.repo}/releases/{release_id}/assets"
                 f"?name={asset_name}"
             )
-            await self._upload(upload_url, blob)
-            await self._prune()
+            try:
+                await self._upload(upload_url, blob)
+                await self._prune()
+            except Exception:
+                # Do not leave an empty release behind when upload fails.
+                try:
+                    await self._api("DELETE", f"/repos/{self.repo}/releases/{release_id}")
+                except Exception:
+                    pass
+                raise
 
             info = BackupInfo(
                 tag=tag,
@@ -173,7 +185,7 @@ class BackupManager:
         return result
 
     # ----------------------------------------------------------------- restore
-    async def restore_latest(self) -> dict[str, int]:
+    async def restore_latest(self) -> dict[str, int | str]:
         if not self.enabled:
             raise BackupError("بکاپ گیت‌هاب تنظیم نشده")
         async with self._lock:
@@ -203,10 +215,25 @@ class BackupManager:
             await asyncio.to_thread(self.memory.backup, pre)
 
             self.memory.close()
-            for suffix in ("", "-wal", "-shm"):
+            for suffix in ("-wal", "-shm"):
                 Path(str(self.memory.path) + suffix).unlink(missing_ok=True)
-            os.replace(tmp, self.memory.path)
-            self.memory.reopen()
+            # os.replace is atomic and keeps the old DB in place if the
+            # replacement itself fails. The pre-restore snapshot remains
+            # available for an explicit rollback.
+            try:
+                os.replace(tmp, self.memory.path)
+            except Exception:
+                self.memory.reopen()
+                raise
+            try:
+                self.memory.reopen()
+            except Exception:
+                # Best-effort rollback so a failed reopen does not strand the
+                # process with a closed/broken live database.
+                self.memory.close()
+                os.replace(pre, self.memory.path)
+                self.memory.reopen()
+                raise
 
             return {
                 "messages": self.memory.total_messages(),

@@ -14,7 +14,7 @@ class Memory:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db = sqlite3.connect(self.path, timeout=5)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=5000")
@@ -109,12 +109,17 @@ class Memory:
             (chat_id,),
         ).fetchall()
 
+        budget = max(1, int(char_budget))
         used = 0
         picked: list[dict[str, str]] = []
         for role, content in rows:  # newest first, then reversed below
+            content = str(content or "")
             size = len(content)
-            if picked and used + size > char_budget:
+            if picked and used + size > budget:
                 break
+            if not picked and size > budget:
+                content = content[:budget].rstrip() + "\n[… پیام برای context کوتاه شد]"
+                size = len(content)
             picked.append({"role": role, "content": content})
             used += size
         picked.reverse()
@@ -183,13 +188,24 @@ class Memory:
         row = self.db.execute("SELECT COUNT(*) FROM archived_messages").fetchone()
         return int(row[0]) if row else 0
 
+    def is_empty(self) -> bool:
+        """Whether there is any user data worth preserving in this database."""
+        for table in ("messages", "archived_messages", "facts", "reminders"):
+            row = self.db.execute(f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)").fetchone()
+            if row and row[0]:
+                return False
+        row = self.db.execute(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE summary != '' LIMIT 1)"
+        ).fetchone()
+        return not bool(row and row[0])
+
     def reopen(self) -> None:
         """Reconnect after the underlying database file was replaced."""
         try:
             self.db.close()
         except sqlite3.Error:
             pass
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db = sqlite3.connect(self.path, timeout=5)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=5000")
@@ -238,7 +254,7 @@ class Memory:
 
     def global_stats(self) -> dict[str, int]:
         messages = self.db.execute("SELECT COUNT(*) FROM messages").fetchone()
-        rows = self.db.execute("SELECT COUNT(DISTINCT chat_id) FROM messages").fetchone()
+        rows = self.db.execute("SELECT COUNT(*) FROM chats").fetchone()
         return {
             "chats": int(rows[0]) if rows else 0,
             "messages": int(messages[0]) if messages else 0,
@@ -247,11 +263,21 @@ class Memory:
         }
 
     def backup(self, target: Path) -> Path:
+        """Create a consistent snapshot without using the live connection.
+
+        Backups are built with ``to_thread``. Using ``self.db`` from that
+        thread while the event loop is writing messages is unsafe even with
+        ``check_same_thread=False``, so the snapshot gets its own connection.
+        """
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             target.unlink()
-        self.db.commit()
-        self.db.execute("VACUUM INTO ?", (str(target),))
+        snapshot = sqlite3.connect(self.path, timeout=15)
+        try:
+            snapshot.execute("PRAGMA busy_timeout=15000")
+            snapshot.execute("VACUUM INTO ?", (str(target),))
+        finally:
+            snapshot.close()
         return target
 
     def close(self) -> None:
@@ -320,15 +346,18 @@ class Memory:
     # ------------------------------------------------------------------ search
     def search_archive(self, chat_id: int, query: str, limit: int = 20) -> list[tuple[str, str, int]]:
         """Search both active and archived messages (the whole history)."""
-        pattern = f"%{query.strip()[:200]}%"
+        query = query.strip()[:200]
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        limit = max(1, min(100, int(limit)))
         rows = self.db.execute(
             """
             SELECT role, content, created_at FROM (
                 SELECT role, content, created_at FROM archived_messages
-                WHERE chat_id = ? AND content LIKE ?
+                WHERE chat_id = ? AND content LIKE ? ESCAPE '\\'
                 UNION ALL
                 SELECT role, content, created_at FROM messages
-                WHERE chat_id = ? AND content LIKE ?
+                WHERE chat_id = ? AND content LIKE ? ESCAPE '\\'
             )
             ORDER BY created_at DESC LIMIT ?
             """,

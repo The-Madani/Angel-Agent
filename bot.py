@@ -84,7 +84,7 @@ async def main() -> None:
     except Exception:
         log.exception("GitHub backups are disabled (check the backup settings)")
 
-    if config.RESTORE_ON_START and backups.enabled and memory.total_messages() == 0:
+    if config.RESTORE_ON_START and backups.enabled and memory.is_empty():
         try:
             result = await backups.restore_latest()
             log.info("restored on start: %s messages, %s archived, tag=%s",
@@ -101,10 +101,17 @@ async def main() -> None:
         workers=8,
     )
 
-    await app.start()
-    me = await app.get_me()
-    handlers = BotHandlers(app, memory, router, compactor, backups, me.username or "")
-    handlers.register(app)
+    try:
+        await app.start()
+        me = await app.get_me()
+        handlers = BotHandlers(app, memory, router, compactor, backups, me.username or "")
+        handlers.register(app)
+    except Exception:
+        log.exception("bot startup failed")
+        await router.close()
+        await backups.close()
+        memory.close()
+        raise
 
     if config.DEBUG:
         from pyrogram.handlers import RawUpdateHandler
@@ -162,16 +169,20 @@ async def main() -> None:
     backup_task = asyncio.create_task(auto_backup(backups, stop))
     reminder_task = asyncio.create_task(reminder_loop(app, memory, stop))
     await stop.wait()
+    await handlers._cancel_all()
+    await compactor.cancel_pending()
     watcher.cancel()
     backup_task.cancel()
     reminder_task.cancel()
     await asyncio.gather(watcher, backup_task, reminder_task, return_exceptions=True)
     log.info("shutting down")
 
-    await app.stop()
-    await router.close()
-    await backups.close()
-    memory.close()
+    try:
+        await app.stop()
+    finally:
+        await router.close()
+        await backups.close()
+        memory.close()
 
 
 if __name__ == "__main__":
