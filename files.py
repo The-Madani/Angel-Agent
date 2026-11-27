@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import mimetypes
 import re
 import zipfile
@@ -201,3 +202,29 @@ def extract_text(path: Path, filename: str = "", mime_type: str = "") -> str:
 
 def is_image(filename: str) -> bool:
     return Path(filename).suffix.lower() in IMAGE_SUFFIXES
+
+
+def pdf_to_images(path: Path, max_pages: int = 6, scale: float = 2.0) -> list[bytes]:
+    """Render PDF pages to PNG bytes so a vision model can read scanned docs."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:  # pragma: no cover - dependency is pinned
+        raise FileError("تبدیل PDF به تصویر ممکن نیست (کتابخانه نصب نیست).") from exc
+
+    images: list[bytes] = []
+    try:
+        doc = pdfium.PdfDocument(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise FileError("این PDF برای تبدیل به تصویر باز نشد.") from exc
+
+    try:
+        for index in range(min(len(doc), max_pages)):
+            page = doc[index]
+            bitmap = page.render(scale=scale)
+            pil = bitmap.to_pil()
+            buffer = io.BytesIO()
+            pil.save(buffer, format="JPEG", quality=85, optimize=True)
+            images.append(buffer.getvalue())
+    finally:
+        doc.close()
+    return images

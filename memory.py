@@ -55,6 +55,22 @@ class Memory:
                 last_latency_ms  INTEGER NOT NULL DEFAULT 0,
                 updated_at       INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS facts (
+                chat_id    INTEGER NOT NULL,
+                key        TEXT    NOT NULL,
+                value      TEXT    NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS reminders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER NOT NULL,
+                text       TEXT    NOT NULL,
+                due_at     INTEGER NOT NULL,
+                sent       INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(sent, due_at);
             """
         )
         self.db.commit()
@@ -243,3 +259,79 @@ class Memory:
             self.db.commit()
         finally:
             self.db.close()
+
+    # ------------------------------------------------------------------- facts
+    def set_fact(self, chat_id: int, key: str, value: str) -> None:
+        now = int(time.time())
+        with self.db:
+            self.db.execute(
+                """
+                INSERT INTO facts (chat_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (chat_id, key.strip()[:80], value.strip()[:2000], now),
+            )
+
+    def get_facts(self, chat_id: int) -> list[tuple[str, str]]:
+        rows = self.db.execute(
+            "SELECT key, value FROM facts WHERE chat_id = ? ORDER BY updated_at DESC",
+            (chat_id,),
+        ).fetchall()
+        return [(str(k), str(v)) for k, v in rows]
+
+    def delete_fact(self, chat_id: int, key: str) -> bool:
+        cur = self.db.execute(
+            "DELETE FROM facts WHERE chat_id = ? AND key = ?", (chat_id, key.strip()[:80])
+        )
+        self.db.commit()
+        return cur.rowcount > 0
+
+    # --------------------------------------------------------------- reminders
+    def add_reminder(self, chat_id: int, text: str, due_at: int) -> int:
+        now = int(time.time())
+        cur = self.db.execute(
+            "INSERT INTO reminders (chat_id, text, due_at, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, text.strip()[:1000], due_at, now),
+        )
+        self.db.commit()
+        return int(cur.lastrowid or 0)
+
+    def due_reminders(self, limit: int = 20) -> list[tuple[int, int, str]]:
+        now = int(time.time())
+        rows = self.db.execute(
+            "SELECT id, chat_id, text FROM reminders WHERE sent = 0 AND due_at <= ? ORDER BY due_at ASC LIMIT ?",
+            (now, limit),
+        ).fetchall()
+        return [(int(i), int(c), str(t)) for i, c, t in rows]
+
+    def mark_reminder_sent(self, reminder_id: int) -> None:
+        self.db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+        self.db.commit()
+
+    def list_reminders(self, chat_id: int) -> list[tuple[int, str, int]]:
+        rows = self.db.execute(
+            "SELECT id, text, due_at FROM reminders WHERE chat_id = ? AND sent = 0 ORDER BY due_at ASC",
+            (chat_id,),
+        ).fetchall()
+        return [(int(i), str(t), int(d)) for i, t, d in rows]
+
+    # ------------------------------------------------------------------ search
+    def search_archive(self, chat_id: int, query: str, limit: int = 20) -> list[tuple[str, str, int]]:
+        """Search both active and archived messages (the whole history)."""
+        pattern = f"%{query.strip()[:200]}%"
+        rows = self.db.execute(
+            """
+            SELECT role, content, created_at FROM (
+                SELECT role, content, created_at FROM archived_messages
+                WHERE chat_id = ? AND content LIKE ?
+                UNION ALL
+                SELECT role, content, created_at FROM messages
+                WHERE chat_id = ? AND content LIKE ?
+            )
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (chat_id, pattern, chat_id, pattern, limit),
+        ).fetchall()
+        return [(str(r), str(c), int(t)) for r, c, t in rows]

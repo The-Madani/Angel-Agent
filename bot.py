@@ -38,6 +38,33 @@ async def auto_backup(manager: BackupManager, stop: asyncio.Event) -> None:
             log.exception("auto backup failed")
 
 
+async def reminder_loop(app: Client, memory: Memory, stop: asyncio.Event) -> None:
+    """Deliver due reminders as private messages."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            due = memory.due_reminders()
+            for rid, chat_id, text in due:
+                try:
+                    await app.send_message(
+                        chat_id,
+                        f"⏰ یادآور: {text}",
+                        disable_notification=False,
+                    )
+                    memory.mark_reminder_sent(rid)
+                    log.info("reminder #%s delivered to chat %s", rid, chat_id)
+                except Exception:
+                    log.exception("reminder #%s delivery failed", rid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("reminder loop iteration failed")
+
+
 async def main() -> None:
     config.validate()
     logging.basicConfig(
@@ -132,10 +159,12 @@ async def main() -> None:
 
     watcher = asyncio.create_task(watchdog(handlers))
     backup_task = asyncio.create_task(auto_backup(backups, stop))
+    reminder_task = asyncio.create_task(reminder_loop(app, memory, stop))
     await stop.wait()
     watcher.cancel()
     backup_task.cancel()
-    await asyncio.gather(watcher, backup_task, return_exceptions=True)
+    reminder_task.cancel()
+    await asyncio.gather(watcher, backup_task, reminder_task, return_exceptions=True)
     log.info("shutting down")
 
     await app.stop()

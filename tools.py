@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -371,9 +372,94 @@ SCHEMAS: list[dict] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": (
+                "یک واقعیت ثابت دربارهٔ کاربر یا گفتگو را برای همیشه ذخیره می‌کند "
+                "(مثل نام، علاقه‌مندی‌ها، قرارها، پروژه‌ها). از این ابزار وقتی استفاده کن "
+                "که کاربر چیزی را دربارهٔ خودش گفت که یادگیری در آینده کمک می‌کند."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "عنوان کوتاه (مثلاً «شهر»، «علاقه»)"},
+                    "value": {"type": "string", "description": "مقدار کامل"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_facts",
+            "description": "واقعیت‌های ذخیره‌شده دربارهٔ کاربر را برمی‌گرداند.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_fact",
+            "description": "یک واقعیت ذخیره‌شده را پاک می‌کند.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "کلید واقعیت برای حذف"}
+                },
+                "required": ["key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": (
+                "یک یادآور تنظیم می‌کند. متن را چک کنه که کاربر صریحاً زمان تعیین کرده "
+                "(مثلاً «۲ ساعت دیگه»، «فردا ساعت ۹»). اگر زمان نسبی است، "
+                "از get_time استفاده کن تا دقیق شود."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "متن یادآور"},
+                    "minutes_from_now": {"type": "integer", "description": "چند دقیقه دیگر"},
+                    "iso_time": {"type": "string", "description": "زمان دقیق ISO (2026-11-27T18:00)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": "یادآورهای فعال کاربر را نشان می‌دهد.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_history",
+            "description": (
+                "در کل آرشیو پیام‌های گذشته (حتی پیام‌های قدیمی که از حافظهٔ فعال "
+                "حذف شده‌اند) جست‌وجو می‌کند."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "عبارت جست‌وجو"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
-async def call(name: str, arguments: str) -> str:
+async def call(name: str, arguments: str, chat_id: int = 0) -> str:
     """Run one tool call and return its text result (never raises)."""
     try:
         data = json.loads(arguments or "{}")
@@ -389,7 +475,19 @@ async def call(name: str, arguments: str) -> str:
             return await web_search(str(data.get("query") or ""))
         if name == "get_time":
             return get_time()
-        return f"خطا: ابزار «{name}» وجود ندارد. فقط read_link، web_search و get_time معتبرند."
+        if name == "remember_fact":
+            return remember_fact(chat_id, str(data.get("key") or ""), str(data.get("value") or ""))
+        if name == "recall_facts":
+            return recall_facts(chat_id)
+        if name == "forget_fact":
+            return forget_fact(chat_id, str(data.get("key") or ""))
+        if name == "search_history":
+            return search_history(chat_id, str(data.get("query") or ""))
+        if name == "set_reminder":
+            return await set_reminder(chat_id, data)
+        if name == "list_reminders":
+            return list_reminders(chat_id)
+        return f"خطا: ابزار «{name}» وجود ندارد."
     except ToolError as exc:
         return f"خطا: {exc}"
     except Exception:  # noqa: BLE001 - a tool must never kill the chat
@@ -403,5 +501,100 @@ def describe(call_name: str, arguments: str) -> str:
         data = json.loads(arguments or "{}")
     except ValueError:
         data = {}
-    target = data.get("url") or data.get("query") or ""
+    target = data.get("url") or data.get("query") or data.get("key") or data.get("text") or ""
     return f"{call_name}({str(target)[:60]})"
+
+
+# ------------------------------------------------------- stateful tool bodies
+# These need the Memory instance; handlers.py injects it at startup via
+# tools.set_memory(memory) so the tool layer stays decoupled from storage.
+_MEMORY = None
+
+
+def set_memory(memory) -> None:
+    global _MEMORY
+    _MEMORY = memory
+
+
+def remember_fact(chat_id: int, key: str, value: str) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    key = key.strip()
+    value = value.strip()
+    if not key or not value:
+        return "خطا: کلید و مقدار نمی‌توانند خالی باشند."
+    _MEMORY.set_fact(chat_id, key, value)
+    return f"ذخیره شد: {key} = {value[:120]}"
+
+
+def recall_facts(chat_id: int) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    facts = _MEMORY.get_facts(chat_id)
+    if not facts:
+        return "هنوز واقعیتی ذخیره نشده است."
+    lines = [f"{i}. {k}: {v[:200]}" for i, (k, v) in enumerate(facts, 1)]
+    return "واقعیت‌های ذخیره‌شده:\n" + "\n".join(lines)
+
+
+def forget_fact(chat_id: int, key: str) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    if _MEMORY.delete_fact(chat_id, key):
+        return f"پاک شد: {key}"
+    return f"واقعیتی با کلید «{key}» پیدا نشد."
+
+
+def search_history(chat_id: int, query: str) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    query = query.strip()
+    if not query:
+        return "خطا: عبارت جست‌وجو خالی بود."
+    rows = _MEMORY.search_archive(chat_id, query)
+    if not rows:
+        return f"چیزی در آرشیو با «{query}» پیدا نشد."
+    lines = [f"نتایج آرشیو برای «{query}»:"]
+    for i, (role, content, ts) in enumerate(rows, 1):
+        who = "کاربر" if role == "user" else "ربات"
+        stamp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"{i}. [{stamp}] {who}: {content[:200]}")
+    return "\n".join(lines)
+
+
+async def set_reminder(chat_id: int, data: dict) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return "خطا: متن یادآور خالی بود."
+    now = int(time.time())
+    due = 0
+    minutes = data.get("minutes_from_now")
+    if isinstance(minutes, (int, float)) and minutes > 0:
+        due = now + int(minutes * 60)
+    else:
+        iso = str(data.get("iso_time") or "").strip()
+        if iso:
+            try:
+                due = int(datetime.fromisoformat(iso).timestamp())
+            except ValueError:
+                return "خطا: زمان ISO نامعتبر بود."
+    if due <= 0:
+        return "خطا: زمان یادآور مشخص نشد (minutes_from_now یا iso_time لازم است)."
+    rid = _MEMORY.add_reminder(chat_id, text, due)
+    when = datetime.fromtimestamp(due).strftime("%Y-%m-%d %H:%M")
+    return f"یادآور #{rid} تنظیم شد: «{text[:80]}» — {when}"
+
+
+def list_reminders(chat_id: int) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    items = _MEMORY.list_reminders(chat_id)
+    if not items:
+        return "هیچ یادآور فعالی نداری."
+    lines = ["یادآورهای فعال:"]
+    for rid, text, due in items:
+        when = datetime.fromtimestamp(due).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"• #{rid} — {when} — {text[:80]}")
+    return "\n".join(lines)

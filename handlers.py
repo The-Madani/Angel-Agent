@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -35,6 +35,12 @@ USER_HELP = """👋 سلام!
 اسمش رو هم بنویس چی می‌خوای (مثلاً «خلاصه‌ش کن»).
 اگه روی یک پیام (مال خودت یا من) ریپلای کنی، همون پیام رو هم می‌بینم.
 
+چیزهایی که خودم یادم می‌مونه:
+- واقعیت‌های ثابتت رو (اسم، شهر، علاقه، قرارها) ذخیره می‌کنم و یادم می‌مونه.
+- اگه بگی «۲ ساعت دیگه یادم بنداز…»، خودم سر وقت بهت پیام می‌دم.
+- توی اینترنت جست‌وجو می‌کنم و لینک‌ها رو می‌خونم.
+- توی همهٔ پیام‌های قبلی‌مون می‌تونم بگردم.
+
 دستورها:
 /reset — پاک کردن حافظهٔ گفتگو
 /help — همین راهنما"""
@@ -53,6 +59,7 @@ ADMIN_HELP = """
 RATE_WARNING = "یه کم آرومتر 🙂"
 QUOTE_MAX_CHARS = 20_000
 TOOL_RESULT_MAX = 12_000
+TOOL_TZ = timezone(timedelta(hours=3, minutes=30), "Asia/Tehran")
 
 
 class BotHandlers:
@@ -79,6 +86,7 @@ class BotHandlers:
         self._mention = re.compile(re.escape(f"@{username}"), re.IGNORECASE) if username else None
         self._restore_until = 0.0
         self.handled = 0
+        tools.set_memory(memory)
 
     def register(self, app: Client) -> None:
         app.add_handler(MessageHandler(self.on_private_message, filters.private))
@@ -182,7 +190,8 @@ class BotHandlers:
             parsed = await self._document(client, message)
             if parsed is None:
                 return
-            name, body = parsed
+            name, body, doc_images = parsed
+            attachment.extend(doc_images)
             question = text or caption or "این فایل رو بخون و خلاصه‌اش رو بگو."
             text = f"فایل «{name}» رو فرستادم. {question}\n\n--- محتوای فایل ---\n{body}"
         elif message.photo is not None:
@@ -219,7 +228,8 @@ class BotHandlers:
         if quoted.document is not None:
             parsed = await self._document(client, quoted, report=False)
             if parsed:
-                name, content = parsed
+                name, content, doc_images = parsed
+                images.extend(doc_images)
                 body = (body + "\n\n" if body else "") + f"[فایل «{name}»]\n{content}"
         elif quoted.photo is not None:
             raw = await self._photo_bytes(client, quoted, report=False)
@@ -234,7 +244,8 @@ class BotHandlers:
 
     async def _document(
         self, client: Client, message: Message, *, report: bool = True
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, list[dict]] | None:
+        """Return (filename, extracted text, image parts)."""
         document = message.document
         name = document.file_name or "file"
         size = document.file_size or 0
@@ -250,20 +261,42 @@ class BotHandlers:
                 if not downloaded:
                     raise files.FileError("فایل دانلود نشد.")
                 body = await asyncio.to_thread(files.extract_text, Path(downloaded), name)
+        except files.FileError as exc:
+            # A scanned PDF has no text layer: render the pages and let the
+            # vision model read them instead.
+            if Path(name).suffix.lower() == ".pdf":
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        path = Path(tmp) / self._safe_name(name)
+                        downloaded = await client.download_media(
+                            message, file_name=str(path)
+                        )
+                        if downloaded:
+                            pages = await asyncio.to_thread(
+                                files.pdf_to_images, Path(downloaded)
+                            )
+                            if pages:
+                                images = [self._image_part(p) for p in pages]
+                                note = (
+                                    f"[این PDF متن قابل استخراج نداشت؛ {len(pages)} صفحهٔ اول "
+                                    "به‌صورت تصویر فرستاده شد — متنشان را از روی تصویر بخوان]"
+                                )
+                                return name, note, images
+                except Exception:
+                    log.warning("pdf->images failed in chat %s", message.chat.id, exc_info=True)
+            if report:
+                await self._reply(message, f"⚠️ {exc}")
+            return None
         except files.UnsupportedFile as exc:
             if report:
                 await self._reply(message, f"⚠️ {exc}\nفرمت‌های پشتیبانی‌شده: {files.SUPPORTED_HINT}.")
-            return None
-        except files.FileError as exc:
-            if report:
-                await self._reply(message, f"⚠️ {exc}")
             return None
         except Exception:
             log.exception("reading document failed in chat %s", message.chat.id)
             if report:
                 await self._reply(message, "⚠️ خواندن فایل نشد. یه بار دیگه بفرست.")
             return None
-        return name, body
+        return name, body, []
 
     async def _photo_bytes(
         self, client: Client, message: Message, *, report: bool = True
@@ -351,7 +384,7 @@ class BotHandlers:
                     break
 
                 rounds += 1
-                request_messages = await self._run_tools(request_messages, calls)
+                request_messages = await self._run_tools(request_messages, calls, chat_id=chat_id)
                 log.info(
                     "tools in chat %s (round %s/%s): %s",
                     chat_id,
@@ -405,6 +438,19 @@ class BotHandlers:
     ) -> list[dict]:
         summary, recent = self.memory.get_context(chat_id, config.CONTEXT_MAX_CHARS)
         messages: list[dict] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+
+        now = datetime.now(TOOL_TZ).strftime("%Y-%m-%d %H:%M")
+        messages.append(
+            {"role": "system", "content": f"الان {now} به وقت تهران است."}
+        )
+
+        facts = self.memory.get_facts(chat_id)
+        if facts:
+            lines = "\n".join(f"- {k}: {v[:300]}" for k, v in facts[:30])
+            messages.append(
+                {"role": "system", "content": "واقعیت‌های ذخیره‌شده دربارهٔ کاربر:\n" + lines}
+            )
+
         if summary:
             messages.append(
                 {"role": "system", "content": "خلاصهٔ گفتگوهای قبلی (برای زمینه):\n" + summary}
@@ -423,7 +469,7 @@ class BotHandlers:
                 messages.append({"role": "user", "content": attachment})
         return messages
 
-    async def _run_tools(self, messages: list[dict], calls: list[dict]) -> list[dict]:
+    async def _run_tools(self, messages: list[dict], calls: list[dict], chat_id: int = 0) -> list[dict]:
         """Run the tool calls the model asked for and append their results."""
         assistant: dict = {"role": "assistant", "content": None, "tool_calls": []}
         for index, call in enumerate(calls):
@@ -442,7 +488,7 @@ class BotHandlers:
         out = [*messages, assistant]
         for call in assistant["tool_calls"]:
             fn = call["function"]
-            result = await tools.call(fn["name"], fn["arguments"])
+            result = await tools.call(fn["name"], fn["arguments"], chat_id=chat_id)
             out.append(
                 {
                     "role": "tool",
