@@ -32,26 +32,106 @@ cp .env.example .env    # مقادیر را پر کن
 .venv/bin/python bot.py
 ```
 
-## متغیرها (`.env` یا Railway Variables)
+## متغیرها: کجا و چه چیزی را پر کن
 
-| کلید | توضیح |
-|---|---|
-| `BOT_TOKEN` | توکن ربات از BotFather |
-| `ADMIN_IDS` | آیدی‌های ادمین، با کاما |
-| `API_ID` / `API_HASH` | MTProto (پیش‌فرض‌ها کار می‌کنند) |
-| `ROUTER_BASE_URL` | آدرس 9router (با `/v1`) |
-| `ROUTER_API_KEY` | کلید 9router |
-| `MODEL` | مثل `fbot` |
-| `DB_PATH` | `./data/history.db` محلی، `/data/history.db` روی Railway |
-| `GITHUB_BACKUP_REPO` | `owner/repo` ریپوی بکاپ (private) |
-| `GITHUB_BACKUP_TOKEN` | fine-grained PAT، فقط `Contents: Read and write` روی همان ریپو |
-| `BACKUP_PASSPHRASE` | رمز رمزنگاری بکاپ؛ گم شود، بکاپ باز نمی‌شود |
-| `BACKUP_KEEP` | تعداد بکاپ نگه‌داری‌شده (پیش‌فرض ۱۴) |
-| `BACKUP_AUTO_HOURS` | فاصلهٔ بکاپ خودکار (پیش‌فرض ۲۴، صفر = خاموش) |
-| `RESTORE_ON_START` | اگر ۱ باشد و دیتابیس خالی باشد، موقع بالا آمدن آخرین بکاپ را خودکار ریستور می‌کند |
-| `TOOLS_ENABLED` | ابزارهای وب/حافظه/یادآور برای مدل (پیش‌فرض ۱) |
-| `TOOL_MAX_ROUNDS` | حداکثر دور صدا زدن ابزار در هر پاسخ (پیش‌فرض ۲) |
-| `TOOL_TIMEOUT` | مهلت هر ابزار به ثانیه (پیش‌فرض ۲۰) |
+دو جا می‌توانی متغیر بگذاری:
+
+- **محلی** (توسعه): فایل `.env` در ریشهٔ پروژه (از `.env.example` کپی کن). این فایل در `.gitignore` است و هرگز commit نمی‌شود.
+- **Railway** (تولید): داشبورد پروژه → سرویس `angel-bot` → تب **Variables**. یا با CLI:
+  `railway variable set -s angel-bot "KEY=VALUE"`.
+
+> اگر هم `.env` داشته باشی و هم Railway Variables، روی Railway مقدارِ Variable اولویت دارد (متغیر محیطی واقعی بر فایل `.env` مقدم است).
+
+### ۱. الزامی — بدون این‌ها ربات بالا نمی‌آید
+
+`config.validate()` فقط این دو را چک می‌کند و اگر خالی باشند با پیام خطا خارج می‌شود.
+
+| کلید | از کجا بگیرم | توضیح |
+|---|---|---|
+| `BOT_TOKEN` | [@BotFather](https://t.me/BotFather) → `/newbot` یا `/token` | توکن ربات |
+| `ROUTER_API_KEY` | داشبورد 9router → API Keys | همین یک کلید هم برای **چت** و هم برای **جست‌وجوی وب** (`/v1/search`) استفاده می‌شود؛ کلید جدا لازم نیست |
+
+### ۲. توصیه‌شده برای استقرار
+
+| کلید | مقدار نمونه | توضیح |
+|---|---|---|
+| `DB_PATH` | `/data/history.db` روی Railway، `./data/history.db` محلی | مسیر SQLite؛ روی Railway باید داخل ولوم باشد |
+| `ROUTER_BASE_URL` | `https://9router-production-de60f1f6.up.railway.app/v1` | آدرس 9router (با `/v1`) |
+| `MODEL` | `fbot` | نام مدل در 9router |
+| `ADMIN_IDS` | `7717921614` | آیدی عددی ادمین‌ها، با کاما. بقیه دستورهای ادمین را نمی‌بینند |
+| `RESTORE_ON_START` | `1` | اگر دیتابیس خالی باشد، موقع بالا آمدن آخرین بکاپ گیت‌هاب را خودکار برمی‌گرداند |
+
+### ۳. بکاپ (اختیاری — بدون این‌ها ربات کار می‌کند، فقط بکاپ گیت‌هاب غیرفعال است)
+
+| کلید | از کجا بگیرم | توضیح |
+|---|---|---|
+| `GITHUB_BACKUP_REPO` | — | مثل `owner/angel-backups`؛ ریپوی **private** جدا از ریپوی کد |
+| `GITHUB_BACKUP_TOKEN` | GitHub → Settings → Developer settings → **Fine-grained tokens** | فقط `Contents: Read and write` روی همان ریپوی بکاپ؛ به ریپوی کد دسترسی نده |
+| `BACKUP_PASSPHRASE` | خودت بساز (مثلاً `openssl rand -base64 24`) | رمز AES-GCM؛ **گم شود بکاپ‌ها باز نمی‌شوند** — یک نسخهٔ آفلاین نگه دار |
+| `BACKUP_KEEP` | `14` | تعداد بکاپ‌های نگه‌داری‌شده |
+| `BACKUP_AUTO_HOURS` | `24` | فاصلهٔ بکاپ خودکار؛ `0` = خاموش |
+
+### ۴. تنظیم دقیق (اختیاری — پیش‌فرض‌ها خوب‌اند)
+
+| کلید | پیش‌فرض | توضیح |
+|---|---|---|
+| `TOOLS_ENABLED` | `1` | ابزارهای وب/حافظه/یادآور برای مدل |
+| `TOOL_MAX_ROUNDS` | `2` | حداکثر دور صدا زدن ابزار در یک پاسخ |
+| `TOOL_TIMEOUT` | `20` | مهلت هر ابزار (ثانیه) |
+| `TOOL_MAX_CHARS` | `24000` | سقف متن برگشتی از لینک/فایل |
+| `MAX_TOKENS` | `8192` | سقف توکن پاسخ |
+| `CONTEXT_MAX_CHARS` | `24000` | سقف کاراکتر تاریخچه در هر درخواست |
+| `HISTORY_MAX_MESSAGES` | `60` | آستانهٔ خلاصه‌سازی خودکار |
+| `HISTORY_KEEP_MESSAGES` | `20` | چند پیام تازه بعد از خلاصه‌سازی بماند |
+| `EDIT_INTERVAL` | `1.2` | فاصلهٔ ادیت پیام استریم (ثانیه) |
+| `THINKING_HINT_DELAY` | `1.5` | بعد از چند ثانیه «در حال فکر کردن…» نشان داده شود |
+| `RATE_MAX_MESSAGES` | `8` | سقف پیام کاربر در `RATE_WINDOW` (پیش‌فرض ۱۰ ثانیه) |
+| `SYSTEM_PROMPT` | (متن پیش‌فرض در `config.py`) | جایگزینی کامل شخصیت؛ خالی = پیش‌فرض |
+| `DEBUG` | خالی | `1` = لاگ کامل آپدیت‌ها |
+
+### نمونهٔ کامل `.env`
+
+```dotenv
+# --- الزامی ---
+BOT_TOKEN=123456:AA...
+ROUTER_API_KEY=sk-...
+
+# --- توصیه‌شده ---
+ADMIN_IDS=7717921614
+API_ID=2040
+API_HASH=b18441a1ff607e10a989891a5462e627
+ROUTER_BASE_URL=https://9router-production-de60f1f6.up.railway.app/v1
+MODEL=fbot
+DB_PATH=./data/history.db
+RESTORE_ON_START=1
+
+# --- بکاپ (اختیاری) ---
+GITHUB_BACKUP_REPO=owner/angel-backups
+GITHUB_BACKUP_TOKEN=github_pat_...
+BACKUP_PASSPHRASE=...
+BACKUP_KEEP=14
+BACKUP_AUTO_HOURS=24
+
+# --- تنظیم دقیق (اختیاری) ---
+TOOLS_ENABLED=1
+TOOL_MAX_ROUNDS=2
+TOOL_TIMEOUT=20
+```
+
+### متغیرهایی که روی Railway ست شده‌اند
+
+```
+DB_PATH=/data/history.db
+MODEL=fbot
+ROUTER_BASE_URL=https://9router-production-de60f1f6.up.railway.app/v1
+RESTORE_ON_START=1
+TOOLS_ENABLED=1
+TOOL_MAX_ROUNDS=2
+TOOL_TIMEOUT=20
+TOOL_MAX_CHARS=24000
+MESSAGE_CHUNK_LIMIT=3800
+```
+به‌علاوهٔ `BOT_TOKEN`، `ROUTER_API_KEY`، `ADMIN_IDS`، `GITHUB_BACKUP_*` و `BACKUP_PASSPHRASE` (مقادیرشان فقط در Railway Variables است، نه در گیت).
 
 ## دستورات
 
@@ -118,6 +198,8 @@ railway service source connect --repo The-Madani/Angel-Agent --branch main --ser
 ## نکات امنیتی
 
 - ریپوی کد (`Angel-Agent`) می‌تواند public باشد؛ `.env`، دیتابیس و لاگ‌ها git-ignore شده‌اند.
+- هیچ کلیدی در کد هاردکد نمی‌شود؛ همه از `config.py` → env خوانده می‌شوند. اگر ریپو را public می‌کنی، فقط `.env.example` (بدون مقدار) در گیت است.
 - ریپوی `angel-backups` باید **private** بماند.
 - توکن بکاپ را فقط به همان ریپوی بکاپ محدود کن.
 - `BACKUP_PASSPHRASE` را در یک جای امن (پسورد منیجر) نگه دار.
+- `ROUTER_API_KEY` را در متن/چت/اسکرین‌شات عمومی نگذار؛ اگر لو رفت، در داشبورد 9router کلید را revoke و کلید تازه بساز و در Railway Variables و `.env` عوض کن.
