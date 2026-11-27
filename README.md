@@ -58,7 +58,7 @@ cp .env.example .env    # مقادیر را پر کن
 | `DB_PATH` | `/data/history.db` روی Railway، `./data/history.db` محلی | مسیر SQLite؛ روی Railway باید داخل ولوم باشد |
 | `ROUTER_BASE_URL` | `https://9router-production-de60f1f6.up.railway.app/v1` | آدرس 9router (با `/v1`) |
 | `MODEL` | `fbot` | نام مدل در 9router |
-| `ADMIN_IDS` | `7717921614` | آیدی عددی ادمین‌ها، با کاما. بقیه دستورهای ادمین را نمی‌بینند |
+| `ADMIN_IDS` | `123456789` | آیدی عددی ادمین‌ها، با کاما. بقیه دستورهای ادمین را نمی‌بینند |
 | `RESTORE_ON_START` | `1` | اگر دیتابیس خالی باشد، موقع بالا آمدن آخرین بکاپ گیت‌هاب را خودکار برمی‌گرداند |
 
 ### ۳. بکاپ (اختیاری — بدون این‌ها ربات کار می‌کند، فقط بکاپ گیت‌هاب غیرفعال است)
@@ -97,7 +97,7 @@ BOT_TOKEN=123456:AA...
 ROUTER_API_KEY=sk-...
 
 # --- توصیه‌شده ---
-ADMIN_IDS=7717921614
+ADMIN_IDS=123456789
 API_ID=2040
 API_HASH=b18441a1ff607e10a989891a5462e627
 ROUTER_BASE_URL=https://9router-production-de60f1f6.up.railway.app/v1
@@ -155,10 +155,10 @@ MESSAGE_CHUNK_LIMIT=3800
 
 مثال‌هایی که مدل خودش ابزار را انتخاب می‌کند:
 
-- «اسم من فرشته‌ست و کرمانشاه زندگی می‌کنم» → `remember_fact`
+- «اسم من ساراست و توی شیراز زندگی می‌کنم» → `remember_fact`
 - «من کجا زندگی می‌کنم؟» → واقعیت‌ها مستقیم در context هستند، بدون ابزار
 - «۲ ساعت دیگه یادم بنداز آب بخورم» → `set_reminder` (بدون دستور `/remind`)
-- «هوای کرمانشاه چطوره؟» → `web_search` + `read_link`
+- «هوای شیراز چطوره؟» → `web_search` + `read_link`
 - «پیدا کن قبلاً دربارهٔ سفر چی گفتم» → `search_history`
 
 ## بکاپ و ریستور
