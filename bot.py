@@ -39,13 +39,8 @@ async def auto_backup(manager: BackupManager, stop: asyncio.Event) -> None:
 
 
 async def reminder_loop(app: Client, memory: Memory, stop: asyncio.Event) -> None:
-    """Deliver due reminders as private messages."""
+    """Deliver due reminders as private messages (immediately, then every 30s)."""
     while not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=30)
-            return
-        except asyncio.TimeoutError:
-            pass
         try:
             due = memory.due_reminders()
             for rid, chat_id, text in due:
@@ -63,6 +58,12 @@ async def reminder_loop(app: Client, memory: Memory, stop: asyncio.Event) -> Non
             raise
         except Exception:
             log.exception("reminder loop iteration failed")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+            return
+        except asyncio.TimeoutError:
+            pass
 
 
 async def main() -> None:
