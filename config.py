@@ -123,8 +123,11 @@ HISTORY_ATTACHMENT_MAX_CHARS = max(
 )
 
 # --- UX / speed -------------------------------------------------------------
-EDIT_INTERVAL = max(0.3, _float("EDIT_INTERVAL", 1.2))
-THINKING_HINT_DELAY = max(0.0, _float("THINKING_HINT_DELAY", 1.5))
+EDIT_INTERVAL = max(0.3, _float("EDIT_INTERVAL", 0.6))
+EDIT_INTERVAL_MAX = max(EDIT_INTERVAL, _float("EDIT_INTERVAL_MAX", 2.0))
+EDIT_MIN_DELTA = max(0, _int("EDIT_MIN_DELTA", 12))
+THINKING_HINT_DELAY = max(0.0, _float("THINKING_HINT_DELAY", 0.8))
+THINKING_TICK_INTERVAL = max(0.5, _float("THINKING_TICK_INTERVAL", 2.0))
 TYPING_INTERVAL = max(2.0, _float("TYPING_INTERVAL", 4.0))
 MESSAGE_CHUNK_LIMIT = max(500, min(3_800, _int("MESSAGE_CHUNK_LIMIT", 3_800)))
 RATE_WINDOW = max(1.0, _float("RATE_WINDOW", 10.0))

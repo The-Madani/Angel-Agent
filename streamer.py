@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-THINKING_TEXT = "در حال فکر کردن…"
+THINKING_TEXT = "🧠 در حال فکر کردن…"
+TOOL_STATUS_TEXT = "🔎 دارم نتیجه رو بررسی می‌کنم…"
 ERROR_TEXT = "⚠️ الان نشد جواب بدم. یه بار دیگه بفرست."
 CUT_TEXT = "\n\n⚠️ ادامهٔ پاسخ قطع شد."
 
@@ -95,6 +96,12 @@ class TelegramStreamer:
         self._answer_started = False
         self._typing_task: asyncio.Task | None = None
         self._thinking_task: asyncio.Task | None = None
+        self._first_lock = asyncio.Lock()
+        self._run_started = 0.0
+        self._status_override: str | None = None
+        self._edit_interval = config.EDIT_INTERVAL
+        self._last_flush_chars = 0
+        self._chunk_chars = 0
         self._stopped = asyncio.Event()
         self.answer = ""
         self.reasoning_chars = 0
@@ -107,20 +114,17 @@ class TelegramStreamer:
         self, events: AsyncIterator[tuple[str, object]], *, allow_empty: bool = False
     ) -> str:
         self._stopped.clear()
+        self._edit_interval = config.EDIT_INTERVAL
+        self._last_flush_chars = 0
+        self._chunk_chars = 0
+        self._run_started = time.monotonic()
         self._typing_task = asyncio.create_task(self._typing_loop())
         self._thinking_task = asyncio.create_task(self._thinking_loop())
-        started = time.monotonic()
         try:
             await self._typing()
             async for kind, payload in events:
                 if kind == "reasoning":
                     self.reasoning_chars += len(str(payload))
-                    if (
-                        not self._answer_started
-                        and self._placeholder is None
-                        and time.monotonic() - started >= config.THINKING_HINT_DELAY
-                    ):
-                        await self._send_placeholder()
                     continue
                 if kind == "usage":
                     self.usage = payload if isinstance(payload, dict) else None
@@ -130,14 +134,26 @@ class TelegramStreamer:
                         self.tool_calls = payload
                     continue
                 if kind == "content":
-                    self._chunks.append(str(payload))
+                    piece = str(payload)
+                    self._chunks.append(piece)
+                    self._chunk_chars += len(piece)
                     if not self._answer_started:
-                        self._answer_started = True
-                        await self._flush()
-                        self._last_edit = time.monotonic()
-                    elif time.monotonic() - self._last_edit >= config.EDIT_INTERVAL:
-                        await self._flush()
-                        self._last_edit = time.monotonic()
+                        # Serialise with the thinking-status loop so the very
+                        # first answer always replaces the same message.
+                        async with self._first_lock:
+                            self._answer_started = True
+                            await self._flush()
+                            self._last_edit = time.monotonic()
+                            self._last_flush_chars = self._chunk_chars
+                    else:
+                        now = time.monotonic()
+                        grew = self._chunk_chars - self._last_flush_chars >= config.EDIT_MIN_DELTA
+                        due = now - self._last_edit >= self._edit_interval
+                        forced = now - self._last_edit >= self._edit_interval * 2
+                        if (due and grew) or forced:
+                            await self._flush()
+                            self._last_edit = now
+                            self._last_flush_chars = self._chunk_chars
 
             if not self._answer_started:
                 if allow_empty:
@@ -188,11 +204,37 @@ class TelegramStreamer:
         self._chunks.clear()
         self._answer_started = False
         self._last_edit = 0.0
+        self._last_flush_chars = 0
+        self._chunk_chars = 0
+        self._status_override = TOOL_STATUS_TEXT
         self.answer = ""
         self.reasoning_chars = 0
         self.usage = None
         self.error = None
         self.tool_calls = []
+        if self._placeholder is not None:
+            try:
+                ok = await asyncio.wait_for(
+                    self._edit(self._placeholder, TOOL_STATUS_TEXT, retry=False),
+                    timeout=3,
+                )
+            except asyncio.TimeoutError:
+                ok = False
+            if ok:
+                self._rendered = [TOOL_STATUS_TEXT]
+        else:
+            # The tool call arrived before the thinking delay elapsed. Give
+            # immediate feedback in the message the next round will reuse.
+            try:
+                placeholder = await asyncio.wait_for(
+                    self._send(TOOL_STATUS_TEXT), timeout=3
+                )
+            except (RPCError, asyncio.TimeoutError):
+                log.debug("could not send tool status in chat %s", self.chat_id)
+            else:
+                self._placeholder = placeholder
+                self._messages = [placeholder]
+                self._rendered = [TOOL_STATUS_TEXT]
 
     async def show_error(self, text: str = ERROR_TEXT) -> None:
         """Replace a pending thinking hint when the caller has no answer."""
@@ -221,31 +263,60 @@ class TelegramStreamer:
                 log.debug("typing action failed in chat %s", self.chat_id, exc_info=True)
 
     async def _thinking_loop(self) -> None:
+        """Show a live thinking status in the one message the answer will use."""
         try:
             await asyncio.sleep(config.THINKING_HINT_DELAY)
-            if not self._answer_started and self._placeholder is None:
-                await self._send_placeholder()
+            while not self._stopped.is_set() and not self._answer_started:
+                async with self._first_lock:
+                    if self._answer_started or self._stopped.is_set():
+                        return
+                    if not await self._ensure_status():
+                        return
+                try:
+                    await asyncio.wait_for(
+                        self._stopped.wait(), timeout=config.THINKING_TICK_INTERVAL
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    pass
         except asyncio.CancelledError:
             raise
         except Exception:
             log.debug("thinking hint failed in chat %s", self.chat_id, exc_info=True)
 
-    # --------------------------------------------------------------- rendering
-    async def _send_placeholder(self) -> None:
-        try:
-            placeholder = await self._send(THINKING_TEXT)
-            if self._answer_started:
-                try:
-                    await placeholder.delete()
-                except Exception:
-                    log.debug("could not remove late thinking hint in chat %s", self.chat_id)
-                return
-            self._placeholder = placeholder
-            self._messages = [self._placeholder]
-            self._rendered = [THINKING_TEXT]
-        except RPCError:
-            log.exception("could not send placeholder in chat %s", self.chat_id)
+    def _status_text(self) -> str:
+        base = self._status_override or THINKING_TEXT
+        elapsed = max(0.0, time.monotonic() - self._run_started)
+        if elapsed < 2:
+            return base
+        return f"{base} {int(elapsed)} ثانیه"
 
+    async def _ensure_status(self) -> bool:
+        """Create or refresh the thinking status; False stops the status loop."""
+        text = self._status_text()
+        if self._placeholder is None:
+            try:
+                placeholder = await asyncio.wait_for(self._send(text), timeout=3)
+            except (RPCError, asyncio.TimeoutError):
+                log.exception("could not send thinking hint in chat %s", self.chat_id)
+                return False
+            self._placeholder = placeholder
+            self._messages = [placeholder]
+            self._rendered = [text]
+            return True
+        if self._rendered and self._rendered[0] == text:
+            return True
+        try:
+            ok = await asyncio.wait_for(
+                self._edit(self._placeholder, text, retry=False), timeout=3
+            )
+        except asyncio.TimeoutError:
+            ok = False
+        if ok:
+            self._rendered = [text]
+        return True
+
+    # --------------------------------------------------------------- rendering
     async def _replace_placeholder(self, text: str) -> None:
         if self._placeholder is not None:
             await self._edit(self._placeholder, text)
@@ -294,17 +365,26 @@ class TelegramStreamer:
             disable_notification=True,
         )
 
-    async def _edit(self, message: Message, text: str, *, as_html: bool = False) -> bool:
-        for attempt in range(2):
+    async def _edit(
+        self, message: Message, text: str, *, as_html: bool = False, retry: bool = True
+    ) -> bool:
+        for attempt in range(2 if retry else 1):
             try:
                 await message.edit_text(
                     text,
                     parse_mode=ParseMode.HTML if as_html else ParseMode.DISABLED,
                     link_preview_options=NO_PREVIEW,
                 )
+                # Ease back towards the base interval after a healthy edit.
+                self._edit_interval = max(
+                    config.EDIT_INTERVAL, self._edit_interval * 0.94
+                )
                 return True
             except FloodWait as exc:
-                if attempt == 0:
+                self._edit_interval = min(
+                    config.EDIT_INTERVAL_MAX, self._edit_interval * 1.7
+                )
+                if retry and attempt == 0:
                     await asyncio.sleep(min(float(exc.value), 3.0))
                     continue
                 return False
