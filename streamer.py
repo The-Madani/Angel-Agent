@@ -241,6 +241,12 @@ class TelegramStreamer:
         self.error = "empty answer"
         await self._replace_placeholder(text)
 
+    async def show_status(self, text: str | None = None) -> None:
+        """Reuse the answer message while preparing input, such as a voice note."""
+        self._status_override = text
+        self._run_started = time.monotonic()
+        await self._ensure_status()
+
     # ------------------------------------------------------------------ typing
     async def _typing(self) -> None:
         try:

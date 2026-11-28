@@ -17,6 +17,7 @@ MAX_FILE_BYTES = config.MAX_FILE_BYTES
 MAX_TEXT_CHARS = config.FILE_MAX_TEXT_CHARS
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+AUDIO_SUFFIXES = {".mp3", ".ogg", ".oga", ".opus", ".wav", ".m4a", ".aac", ".flac", ".webm"}
 TEXT_SUFFIXES = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml",
     ".xml", ".html", ".htm", ".css", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".py",
@@ -27,7 +28,7 @@ TEXT_SUFFIXES = {
 
 SUPPORTED_HINT = (
     "PDF، Word (docx)، Excel (xlsx)، PowerPoint (pptx)، "
-    "فایل‌های متنی مثل txt / md / csv / json / کد، و عکس"
+    "فایل‌های متنی مثل txt / md / csv / json / کد، عکس و فایل صوتی"
 )
 
 
@@ -207,6 +208,10 @@ def extract_text(path: Path, filename: str = "", mime_type: str = "") -> str:
 
 def is_image(filename: str) -> bool:
     return Path(filename).suffix.lower() in IMAGE_SUFFIXES
+
+
+def is_audio(filename: str, mime_type: str = "") -> bool:
+    return Path(filename).suffix.lower() in AUDIO_SUFFIXES or mime_type.lower().startswith("audio/")
 
 
 def pdf_to_images(path: Path, max_pages: int = 6, scale: float = 2.0) -> list[bytes]:

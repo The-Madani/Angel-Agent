@@ -80,14 +80,18 @@ MODEL = _str("MODEL", "fbot")
 MAX_TOKENS = max(64, _int("MAX_TOKENS", 8192))
 REQUEST_TIMEOUT = max(10.0, _float("REQUEST_TIMEOUT", 300.0))
 MAX_CONCURRENT = max(1, min(100, _int("MAX_CONCURRENT", 20)))
+TRANSCRIPTION_MODEL = _str("TRANSCRIPTION_MODEL", "gemini/gemini-2.5-flash")
+TRANSCRIPTION_TIMEOUT = max(10.0, _float("TRANSCRIPTION_TIMEOUT", 120.0))
 
 # --- Persona ----------------------------------------------------------------
 DEFAULT_SYSTEM_PROMPT = (
     "تو «Angel Agent» هستی؛ یک دستیار هوش مصنوعی که مخصوص فرشته ساخته شده.\n"
     "با فرشته گرم، خودی و طبیعی حرف بزن؛ لحن دوستانه داشته باش و لازم نیست رسمی یا خشک باشی.\n"
-    "به فارسی، کوتاه و مستقیم جواب بده. حاشیه نرو، تکرار نکن و الکی طولش نده. "
-    "اگه سؤال توضیح لازم داشت، فقط تا حد لازم توضیح بده.\n"
-    "اگه سؤال پزشکی پرسید، کامل و دقیق کمکش کن و توصیه‌های لازم رو بده. "
+    "به فارسی، کوتاه، روشن و مستقیم جواب بده. پاسخ پیش‌فرض را بی‌جهت طولانی و خسته‌کننده نکن. "
+    "مقدمهٔ اضافی، تکرار سؤال، توضیح بدیهیات و جمع‌بندی تکراری نده. "
+    "فقط وقتی کاربر در درخواستش توضیح مفصل، جزئیات، مثال‌های بیشتر یا مراحل کامل خواست، "
+    "پاسخ را متناسب با همان درخواست بلندتر کن. نکات لازم برای درستی پاسخ را فشرده بگو.\n"
+    "اگه سؤال پزشکی پرسید، کامل و دقیق کمکش کن و توصیه‌های ضروری رو فشرده بگو. "
     "فقط اگه واقعاً لازم بود، آخر جواب بگو به کدوم متخصص مراجعه کنه.\n"
     "اگه چیزی رو نمی‌دونی، صادقانه بگو و اطلاعات الکی نساز.\n"
     "ابزارهایی که داری: read_link (خواندن لینک)، web_search (جست‌وجو در اینترنت)، "
@@ -152,6 +156,10 @@ TOOL_RESULT_MAX_CHARS = max(2_000, _int("TOOL_RESULT_MAX_CHARS", 6_000))
 # predictable payloads. These limits also protect the worker from pathological
 # PDFs with huge page dimensions.
 MAX_FILE_BYTES = max(1_024 * 1_024, _int("MAX_FILE_BYTES", 20 * 1024 * 1024))
+AUDIO_MAX_BYTES = max(
+    1_024 * 1_024,
+    min(MAX_FILE_BYTES, 20 * 1024 * 1024, _int("AUDIO_MAX_BYTES", 20 * 1024 * 1024)),
+)
 FILE_MAX_TEXT_CHARS = max(4_000, _int("FILE_MAX_TEXT_CHARS", 60_000))
 OCR_MAX_PAGES = max(1, min(12, _int("OCR_MAX_PAGES", 6)))
 OCR_MAX_IMAGE_BYTES = max(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import mimetypes
 import re
 import tempfile
 import time
@@ -23,7 +24,7 @@ import tools
 from backups import BackupError, BackupManager
 from compactor import Compactor
 from memory import Memory
-from router import Router
+from router import Router, RouterError
 from streamer import TelegramStreamer
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ USER_HELP = """👋 سلام!
 هر سؤالی داری همین‌جا بپرس، جواب می‌دم.
 
 می‌تونی فایل هم بفرستی: PDF، Word، Excel، PowerPoint، فایل متنی/کد و عکس.
+ویس یا فایل صوتی هم بفرست؛ حرفت رو به متن تبدیل می‌کنم و جواب می‌دم.
 اسمش رو هم بنویس چی می‌خوای (مثلاً «خلاصه‌ش کن»).
 اگه روی یک پیام (مال خودت یا من) ریپلای کنی، همون پیام رو هم می‌بینم.
 
@@ -115,7 +117,7 @@ class BotHandlers:
 
         text = (message.text or "").strip()
         caption = (message.caption or "").strip()
-        if not text and not message.document and not message.photo:
+        if not text and not any((message.document, message.photo, message.voice, message.audio)):
             return
 
         if self._maintenance:
@@ -155,7 +157,9 @@ class BotHandlers:
             return False
         if message.sender_chat is not None or message.via_bot is not None:
             return False
-        return bool((message.text or "").strip()) or message.document is not None or message.photo is not None
+        return bool((message.text or "").strip()) or any(
+            media is not None for media in (message.document, message.photo, message.voice, message.audio)
+        )
 
     def _remember(self, message: Message) -> bool:
         key = (message.chat.id, message.id)
@@ -190,13 +194,24 @@ class BotHandlers:
     async def _respond(
         self, client: Client, message: Message, text: str, caption: str
     ) -> None:
-        """Build one model turn from the message, its file, and any quoted reply."""
-        quote_label, quote_text, quote_images = await self._quote(client, message.reply_to_message)
-
-        attachment: list[dict] = list(quote_images)
+        """Build one model turn from text, media, and any quoted reply."""
+        attachment: list[dict] = []
         stored: str | None = None
+        streamer: TelegramStreamer | None = None
 
-        if message.document is not None:
+        if self._audio_media(message) is not None:
+            streamer = TelegramStreamer(client, message.chat.id)
+            await streamer.show_status("🎙 دارم صدا رو به متن تبدیل می‌کنم…")
+            transcript = await self._audio_text(client, message, streamer=streamer)
+            if transcript is None:
+                return
+            label = "ویس" if message.voice is not None else "فایل صوتی"
+            question = text or caption
+            text = f"[متن {label} کاربر]\n{transcript}"
+            if question:
+                text = question + "\n\n" + text
+            stored = self._history_excerpt(text)
+        elif message.document is not None:
             parsed = await self._document(client, message)
             if parsed is None:
                 return
@@ -217,6 +232,12 @@ class BotHandlers:
         if not text.strip():
             return
 
+        quoted = message.reply_to_message
+        if quoted is not None and self._audio_media(quoted) is not None and streamer is None:
+            streamer = TelegramStreamer(client, message.chat.id)
+            await streamer.show_status("🎙 دارم صدا رو به متن تبدیل می‌کنم…")
+        quote_label, quote_text, quote_images = await self._quote(client, quoted)
+        attachment = [*quote_images, *attachment]
         if quote_text:
             header = f"[در پاسخ به {quote_label}]:\n«{quote_text}»"
             text = header + "\n\n" + text
@@ -224,7 +245,7 @@ class BotHandlers:
                 stored = header + "\n\n" + stored
 
         await self._answer(
-            client, message, text, attachment=attachment or None, stored=stored
+            client, message, text, attachment=attachment or None, stored=stored, streamer=streamer
         )
 
     async def _quote(self, client: Client, quoted: Message | None) -> tuple[str, str, list[dict]]:
@@ -236,7 +257,11 @@ class BotHandlers:
         body = (quoted.text or quoted.caption or "").strip()
         images: list[dict] = []
 
-        if quoted.document is not None:
+        if self._audio_media(quoted) is not None:
+            transcript = await self._audio_text(client, quoted, report=False)
+            content = f"[متن ویس/صدا]\n{transcript}" if transcript else "[متن این صدا قابل دریافت نبود]"
+            body = (body + "\n\n" if body else "") + content
+        elif quoted.document is not None:
             parsed = await self._document(client, quoted, report=False)
             if parsed:
                 name, content, doc_images = parsed
@@ -312,6 +337,57 @@ class BotHandlers:
             return None
         return name, body, []
 
+    @staticmethod
+    def _audio_media(message: Message):
+        media = message.voice or message.audio
+        if media is not None:
+            return media
+        document = message.document
+        if document is not None and files.is_audio(document.file_name or "", document.mime_type or ""):
+            return document
+        return None
+
+    async def _audio_text(
+        self, client: Client, message: Message, *, report: bool = True,
+        streamer: TelegramStreamer | None = None,
+    ) -> str | None:
+        """Transcribe a temporary download; keep only text in conversation memory."""
+        media = self._audio_media(message)
+        if media is None:
+            return None
+        try:
+            if (media.file_size or 0) > config.AUDIO_MAX_BYTES:
+                limit_mb = config.AUDIO_MAX_BYTES / (1024 * 1024)
+                raise files.FileError(f"حجم فایل صوتی بیشتر از {limit_mb:g} مگابایت است؛ فایل کوتاه‌تری بفرست.")
+            mime_type = media.mime_type or ""
+            suffix = mimetypes.guess_extension(mime_type) or ".ogg"
+            name = self._safe_name(getattr(media, "file_name", None) or f"audio{suffix}")
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / name
+                downloaded = await asyncio.wait_for(
+                    client.download_media(message, file_name=str(path)),
+                    timeout=config.TRANSCRIPTION_TIMEOUT,
+                )
+                if not downloaded:
+                    raise files.FileError("صدا دانلود نشد. یه بار دیگه بفرست.")
+                return await self.router.transcribe(
+                    Path(downloaded), filename=name, mime_type=mime_type
+                )
+        except (files.FileError, RouterError) as exc:
+            error = str(exc)
+            log.warning("audio transcription failed in chat %s: %s", message.chat.id, error)
+        except asyncio.TimeoutError:
+            error = "دانلود صدا طول کشید؛ دوباره امتحان کن."
+        except Exception:
+            log.exception("processing audio failed in chat %s", message.chat.id)
+            error = "خواندن صدا نشد. یه بار دیگه بفرست."
+        if report:
+            if streamer is not None:
+                await streamer.show_error(f"⚠️ {error}")
+            else:
+                await self._reply(message, f"⚠️ {error}")
+        return None
+
     async def _photo_bytes(
         self, client: Client, message: Message, *, report: bool = True
     ) -> bytes | None:
@@ -385,11 +461,15 @@ class BotHandlers:
         *,
         attachment: list[dict] | None = None,
         stored: str | None = None,
+        streamer: TelegramStreamer | None = None,
     ) -> None:
         chat_id = message.chat.id
         started = time.perf_counter()
+        if streamer is None:
+            streamer = TelegramStreamer(client, chat_id)
+        else:
+            await streamer.show_status()
         msg_id = self.memory.add_message(chat_id, "user", stored or text)
-        streamer = TelegramStreamer(client, chat_id)
         request_messages = self._build_messages(
             chat_id, attachment, current_text=text
         )

@@ -7,6 +7,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -136,7 +137,7 @@ class ReminderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_migrates_old_database_without_losing_reminders(self) -> None:
         legacy_path = Path(self.tmp.name) / "legacy.db"
-        with sqlite3.connect(legacy_path) as db:
+        with closing(sqlite3.connect(legacy_path)) as db:
             db.executescript("""
                 CREATE TABLE reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,

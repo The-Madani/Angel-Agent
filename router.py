@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import time
+from pathlib import Path
 from typing import AsyncIterator, Iterable
 
 import aiohttp
@@ -55,6 +57,72 @@ class Router:
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    # ------------------------------------------------------------- transcription
+    async def transcribe(
+        self, path: Path, *, filename: str = "", mime_type: str = ""
+    ) -> str:
+        """Upload audio as multipart data and return its transcript."""
+        try:
+            size = (await asyncio.to_thread(path.stat)).st_size
+        except OSError as exc:
+            raise RouterError("فایل صوتی در دسترس نیست.") from exc
+        if not size:
+            raise RouterError("فایل صوتی خالی است.")
+        if size > config.AUDIO_MAX_BYTES:
+            raise RouterError("حجم فایل صوتی بیشتر از حد مجاز است؛ فایل کوتاه‌تری بفرست.")
+
+        if self._session is None or self._session.closed:
+            await self.start()
+        assert self._session is not None
+        name = Path(filename or path.name).name
+        content_type = mime_type.split(";", 1)[0].strip().lower()
+        if not content_type.startswith("audio/"):
+            content_type = mimetypes.guess_type(name)[0] or content_type or "application/octet-stream"
+        if content_type == "video/webm":
+            content_type = "audio/webm"
+        timeout = aiohttp.ClientTimeout(
+            total=config.TRANSCRIPTION_TIMEOUT,
+            connect=min(15.0, config.TRANSCRIPTION_TIMEOUT),
+        )
+        async with self._sem:
+            try:
+                with path.open("rb") as audio:
+                    form = aiohttp.FormData()
+                    form.add_field("file", audio, filename=name, content_type=content_type)
+                    form.add_field("model", config.TRANSCRIPTION_MODEL)
+                    payload = form()
+                    # The shared chat session defaults to JSON/SSE. Override
+                    # both headers so aiohttp sends the multipart boundary.
+                    headers = {
+                        "Content-Type": payload.content_type,
+                        "Accept": "application/json",
+                    }
+                    async with self._session.post(
+                        f"{config.ROUTER_BASE_URL}/audio/transcriptions",
+                        data=payload,
+                        headers=headers,
+                        timeout=timeout,
+                    ) as resp:
+                        if resp.status != 200:
+                            # Provider error bodies may contain request data;
+                            # only expose the status code in logs and replies.
+                            raise RouterError(f"تبدیل صدا انجام نشد (کد {resp.status}). دوباره امتحان کن.")
+                        try:
+                            data = await resp.json(content_type=None)
+                        except (ValueError, UnicodeDecodeError) as exc:
+                            raise RouterError("پاسخ سرویس تبدیل صدا معتبر نبود. دوباره امتحان کن.") from exc
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError as exc:
+                raise RouterError("تبدیل صدا طول کشید؛ دوباره امتحان کن یا ویس کوتاه‌تری بفرست.") from exc
+            except (aiohttp.ClientError, OSError) as exc:
+                raise RouterError("اتصال به سرویس تبدیل صدا نشد. دوباره امتحان کن.") from exc
+
+        text = data.get("text") if isinstance(data, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise RouterError("گفتار قابل تشخیصی در این صدا پیدا نشد؛ واضح‌تر ضبط کن و دوباره بفرست.")
+        return text.strip()
 
     # ------------------------------------------------------------------ stream
     async def stream(
