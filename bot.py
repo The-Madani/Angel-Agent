@@ -39,7 +39,7 @@ async def auto_backup(manager: BackupManager, stop: asyncio.Event) -> None:
 
 
 async def reminder_loop(app: Client, memory: Memory, stop: asyncio.Event) -> None:
-    """Deliver due reminders as private messages (immediately, then every 30s)."""
+    """Deliver reminders and advance routines (immediately, then every 30s)."""
     while not stop.is_set():
         try:
             due = memory.due_reminders()

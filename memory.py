@@ -67,12 +67,18 @@ class Memory:
                 chat_id    INTEGER NOT NULL,
                 text       TEXT    NOT NULL,
                 due_at     INTEGER NOT NULL,
+                repeat_minutes INTEGER NOT NULL DEFAULT 0,
                 sent       INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(sent, due_at);
             """
         )
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(reminders)")}
+        if "repeat_minutes" not in columns:
+            self.db.execute(
+                "ALTER TABLE reminders ADD COLUMN repeat_minutes INTEGER NOT NULL DEFAULT 0"
+            )
         self.db.commit()
 
     # --------------------------------------------------------------- messages
@@ -315,11 +321,22 @@ class Memory:
         return cur.rowcount > 0
 
     # --------------------------------------------------------------- reminders
-    def add_reminder(self, chat_id: int, text: str, due_at: int) -> int:
+    def add_reminder(
+        self, chat_id: int, text: str, due_at: int, repeat_minutes: int = 0
+    ) -> int:
+        if (
+            isinstance(repeat_minutes, bool)
+            or not isinstance(repeat_minutes, int)
+            or repeat_minutes < 0
+        ):
+            raise ValueError("repeat_minutes must be a non-negative integer")
         now = int(time.time())
         cur = self.db.execute(
-            "INSERT INTO reminders (chat_id, text, due_at, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, text.strip()[:1000], due_at, now),
+            """
+            INSERT INTO reminders (chat_id, text, due_at, repeat_minutes, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (chat_id, text.strip()[:1000], due_at, repeat_minutes, now),
         )
         self.db.commit()
         return int(cur.lastrowid or 0)
@@ -333,15 +350,47 @@ class Memory:
         return [(int(i), int(c), str(t)) for i, c, t in rows]
 
     def mark_reminder_sent(self, reminder_id: int) -> None:
-        self.db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
-        self.db.commit()
+        """Finish a one-shot reminder or advance a routine without time drift.
 
-    def list_reminders(self, chat_id: int) -> list[tuple[int, str, int]]:
+        After downtime, deliver once and skip missed slots. Keep the original
+        schedule rather than measuring the next interval from delivery time.
+        """
+        now = int(time.time())
+        with self.db:
+            row = self.db.execute(
+                "SELECT due_at, repeat_minutes FROM reminders WHERE id = ? AND sent = 0",
+                (reminder_id,),
+            ).fetchone()
+            if not row:
+                return
+            due_at, repeat_minutes = row
+            if repeat_minutes > 0:
+                seconds = repeat_minutes * 60
+                steps = max(1, (now - due_at) // seconds + 1)
+                self.db.execute(
+                    "UPDATE reminders SET due_at = ? WHERE id = ? AND sent = 0",
+                    (due_at + steps * seconds, reminder_id),
+                )
+            else:
+                self.db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+
+    def list_reminders(self, chat_id: int) -> list[tuple[int, str, int, int]]:
         rows = self.db.execute(
-            "SELECT id, text, due_at FROM reminders WHERE chat_id = ? AND sent = 0 ORDER BY due_at ASC",
+            """
+            SELECT id, text, due_at, repeat_minutes FROM reminders
+            WHERE chat_id = ? AND sent = 0 ORDER BY due_at ASC
+            """,
             (chat_id,),
         ).fetchall()
-        return [(int(i), str(t), int(d)) for i, t, d in rows]
+        return [(int(i), str(t), int(d), int(r)) for i, t, d, r in rows]
+
+    def cancel_reminder(self, chat_id: int, reminder_id: int) -> bool:
+        cur = self.db.execute(
+            "UPDATE reminders SET sent = 1 WHERE id = ? AND chat_id = ? AND sent = 0",
+            (reminder_id, chat_id),
+        )
+        self.db.commit()
+        return cur.rowcount > 0
 
     # ------------------------------------------------------------------ search
     def search_archive(self, chat_id: int, query: str, limit: int = 20) -> list[tuple[str, str, int]]:

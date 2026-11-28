@@ -440,16 +440,36 @@ SCHEMAS: list[dict] = [
         "function": {
             "name": "set_reminder",
             "description": (
-                "یک یادآور تنظیم می‌کند. متن را چک کنه که کاربر صریحاً زمان تعیین کرده "
-                "(مثلاً «۲ ساعت دیگه»، «فردا ساعت ۹»). اگر زمان نسبی است، "
-                "از get_time استفاده کن تا دقیق شود."
+                "یادآور یک‌باره یا تکرارشونده می‌سازد. برای «هر روز» repeat=daily، "
+                "برای «هر هفته» repeat=weekly و برای «هر چند دقیقه/ساعت/روز» "
+                "repeat=interval و interval_minutes را بده. زمان اولین نوبت را با "
+                "یکی از iso_time یا minutes_from_now مشخص کن؛ زمان بدون منطقهٔ زمانی "
+                "به وقت تهران است. در حالت interval، بدون زمان شروع، اولین نوبت یک "
+                "فاصله بعد از الان است. اگر ساعت روتین روزانه/هفتگی معلوم نیست، از کاربر بپرس."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "متن یادآور"},
-                    "minutes_from_now": {"type": "integer", "description": "چند دقیقه دیگر"},
-                    "iso_time": {"type": "string", "description": "زمان دقیق ISO (2026-11-27T18:00)"},
+                    "minutes_from_now": {
+                        "type": "integer", "minimum": 1,
+                        "description": "اولین نوبت چند دقیقه دیگر باشد؛ هم‌زمان با iso_time نده",
+                    },
+                    "iso_time": {
+                        "type": "string",
+                        "description": "زمان اولین نوبت به صورت ISO؛ بدون timezone یعنی تهران (2030-01-01T09:00)",
+                    },
+                    "repeat": {
+                        "type": "string",
+                        "enum": ["none", "daily", "weekly", "interval"],
+                        "description": "نوع تکرار؛ پیش‌فرض none (یک‌باره)",
+                    },
+                    "interval_minutes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 525600,
+                        "description": "فقط برای repeat=interval: فاصلهٔ تکرار به دقیقه (مثلاً هر ۲ ساعت = ۱۲۰، هر ۳ روز = ۴۳۲۰)",
+                    },
                 },
                 "required": ["text"],
             },
@@ -459,8 +479,25 @@ SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_reminders",
-            "description": "یادآورهای فعال کاربر را نشان می‌دهد.",
+            "description": "یادآورهای فعال همین کاربر، شماره، زمان نوبت بعد و دورهٔ تکرارشان را نشان می‌دهد.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_reminder",
+            "description": (
+                "یادآور یک‌باره یا روتین همین کاربر را با شماره لغو می‌کند. "
+                "اگر شماره مشخص نیست، اول list_reminders را بخوان و یادآور موردنظر را پیدا کن."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_id": {"type": "integer", "minimum": 1, "description": "شمارهٔ یادآور از list_reminders"}
+                },
+                "required": ["reminder_id"],
+            },
         },
     },
     {
@@ -521,6 +558,8 @@ async def _dispatch(name: str, data: dict, chat_id: int) -> str:
         return await set_reminder(chat_id, data)
     if name == "list_reminders":
         return list_reminders(chat_id)
+    if name == "cancel_reminder":
+        return cancel_reminder(chat_id, data.get("reminder_id"))
     return f"خطا: ابزار «{name}» وجود ندارد."
 
 
@@ -597,33 +636,78 @@ async def set_reminder(chat_id: int, data: dict) -> str:
     text = str(data.get("text") or "").strip()
     if not text:
         return "خطا: متن یادآور خالی بود."
+
+    repeat = data.get("repeat", "none")
+    periods = {"none": 0, "daily": 1440, "weekly": 10080}
+    if not isinstance(repeat, str) or repeat not in (*periods, "interval"):
+        return "خطا: نوع تکرار باید none، daily، weekly یا interval باشد."
+    interval = data.get("interval_minutes")
+    if repeat == "interval":
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, int)
+            or not 1 <= interval <= 525600
+        ):
+            return "خطا: فاصلهٔ تکرار باید عدد صحیحی بین ۱ و ۵۲۵۶۰۰ دقیقه باشد."
+        period = interval
+    else:
+        if interval is not None:
+            return "خطا: interval_minutes فقط برای repeat=interval است."
+        period = periods[repeat]
+
     now = int(time.time())
     due = 0
     minutes = data.get("minutes_from_now")
-    if minutes is not None and not isinstance(minutes, bool):
+    iso = str(data.get("iso_time") or "").strip()
+    if minutes is not None and iso:
+        return "خطا: فقط یکی از minutes_from_now یا iso_time را برای اولین نوبت مشخص کن."
+    if minutes is not None:
         try:
             minutes_value = float(minutes)
-        except (TypeError, ValueError):
-            minutes_value = 0.0
-        if math.isfinite(minutes_value) and minutes_value > 0:
+            if (
+                isinstance(minutes, bool)
+                or not math.isfinite(minutes_value)
+                or minutes_value <= 0
+            ):
+                raise ValueError
             due = now + int(minutes_value * 60)
-    if due <= 0:
-        iso = str(data.get("iso_time") or "").strip()
-        if iso:
-            try:
-                parsed = datetime.fromisoformat(iso)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=TEHRAN)
-                else:
-                    parsed = parsed.astimezone(TEHRAN)
-                due = int(parsed.timestamp())
-            except (ValueError, OverflowError):
-                return "خطا: زمان ISO نامعتبر بود."
+        except (TypeError, ValueError, OverflowError):
+            return "خطا: فاصله تا اولین نوبت باید تعداد دقیقهٔ مثبت و معتبر باشد."
+    elif iso:
+        try:
+            parsed = datetime.fromisoformat(iso)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=TEHRAN)
+            due = int(parsed.timestamp())
+        except (ValueError, OverflowError, OSError):
+            return "خطا: زمان ISO نامعتبر بود."
+        if period and due <= now:
+            seconds = period * 60
+            due += ((now - due) // seconds + 1) * seconds
+    elif repeat == "interval":
+        due = now + period * 60
+
     if due <= now:
-        return "خطا: زمان یادآور مشخص نشد (minutes_from_now یا iso_time لازم است)."
-    rid = _MEMORY.add_reminder(chat_id, text, due)
-    when = datetime.fromtimestamp(due, TEHRAN).strftime("%Y-%m-%d %H:%M")
-    return f"یادآور #{rid} تنظیم شد: «{text[:80]}» — {when}"
+        return "خطا: زمان اولین نوبت باید در آینده باشد؛ minutes_from_now یا iso_time را مشخص کن."
+    try:
+        when = datetime.fromtimestamp(due, TEHRAN).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OverflowError, OSError):
+        return "خطا: زمان یادآور خارج از محدودهٔ معتبر است."
+    rid = _MEMORY.add_reminder(chat_id, text, due, repeat_minutes=period)
+    return f"یادآور #{rid} تنظیم شد: «{text[:80]}» — {_repeat_label(period)}؛ نوبت بعد: {when} (تهران)"
+
+
+def _repeat_label(minutes: int) -> str:
+    if not minutes:
+        return "یک‌بار"
+    if minutes == 1440:
+        return "هر روز"
+    if minutes == 10080:
+        return "هر هفته"
+    for unit, label in ((10080, "هفته"), (1440, "روز"), (60, "ساعت")):
+        if minutes % unit == 0:
+            return f"هر {minutes // unit} {label}"
+    return f"هر {minutes} دقیقه"
 
 
 def list_reminders(chat_id: int) -> str:
@@ -633,7 +717,21 @@ def list_reminders(chat_id: int) -> str:
     if not items:
         return "هیچ یادآور فعالی نداری."
     lines = ["یادآورهای فعال:"]
-    for rid, text, due in items:
+    for rid, text, due, period in items:
         when = datetime.fromtimestamp(due, TEHRAN).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"• #{rid} — {when} — {text[:80]}")
+        lines.append(f"• #{rid} — {_repeat_label(period)} — نوبت بعد: {when} (تهران) — {text[:80]}")
     return "\n".join(lines)
+
+
+def cancel_reminder(chat_id: int, reminder_id: int) -> str:
+    if _MEMORY is None:
+        return "خطا: حافظه در دسترس نیست."
+    if (
+        isinstance(reminder_id, bool)
+        or not isinstance(reminder_id, int)
+        or not 1 <= reminder_id <= 2**63 - 1
+    ):
+        return "خطا: شمارهٔ یادآور باید عدد صحیح مثبت و معتبر باشد."
+    if _MEMORY.cancel_reminder(chat_id, reminder_id):
+        return f"یادآور #{reminder_id} لغو شد."
+    return "یادآور فعالی با این شماره در این گفتگو پیدا نشد."
